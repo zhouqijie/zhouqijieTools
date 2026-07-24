@@ -1,0 +1,5 @@
+ReconstructionNative/1.0.0
+PoseLib 2.0.5 (7e9f5f53372e43f89655040d4dfc4a00e5ace11c)
+Ceres Solver 2.2.0 (85331393dc0dff09f6fb9903ab0c4bfa3e134b01)
+Eigen 3.4.0 (3147391d946bb4b6c68edd901f2add6ac1f31f8c)
+Target: Windows x64 UnityEditor, static CRT
