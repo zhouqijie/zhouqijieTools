@@ -2,7 +2,8 @@
   "name": "ReconstructionTool.Runtime",
   "rootNamespace": "ReconstructionTool",
   "references": [
-    "UnityEngine.UI"
+        "UnityEngine.UIModule",
+        "UnityEngine.UI"
   ],
   "includePlatforms": [],
   "excludePlatforms": [],

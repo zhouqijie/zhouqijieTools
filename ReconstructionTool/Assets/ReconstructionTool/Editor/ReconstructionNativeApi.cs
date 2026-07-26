@@ -6,7 +6,7 @@ namespace ReconstructionTool.Editor
 {
     internal static class ReconstructionNativeApi
     {
-        private const string LibraryName = "ReconstructionNative";
+        private const string LibraryName = "ReconstructionNative_1_8";
 
         internal enum Status
         {
@@ -27,6 +27,8 @@ namespace ReconstructionTool.Editor
             public int Height;
             public double MinimumVerticalFov;
             public double MaximumVerticalFov;
+            public double Confidence;
+            public int PoseOnly;
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -34,6 +36,16 @@ namespace ReconstructionTool.Editor
         {
             public double X;
             public double Y;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct LineObservation
+        {
+            public double StartX;
+            public double StartY;
+            public double EndX;
+            public double EndY;
+            public double Confidence;
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -74,12 +86,27 @@ namespace ReconstructionTool.Editor
         }
 
         [StructLayout(LayoutKind.Sequential)]
+        internal struct LineOutput
+        {
+            public int Id;
+            public double PointX;
+            public double PointY;
+            public double PointZ;
+            public double DirectionX;
+            public double DirectionY;
+            public double DirectionZ;
+            public double ReprojectionRmsPixels;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
         internal struct SolveReport
         {
             public int Status;
             public int PointCount;
             public int InlierCount;
+            public int LineCount;
             public double NormalizedReprojectionRms;
+            public double NormalizedLineRms;
             public double MedianTriangulationAngle;
             public double AppliedScale;
         }
@@ -88,14 +115,23 @@ namespace ReconstructionTool.Editor
         private static extern IntPtr RT_GetVersion();
 
         [DllImport(LibraryName, CallingConvention = CallingConvention.Cdecl)]
-        private static extern int RT_SolveThreeView(
+        private static extern int RT_SolveMultiView(
             [In] CameraInput[] cameras,
+            int cameraCount,
             [In] int[] pointIds,
             [In] Observation[] observations,
+            [In] byte[] observationVisibility,
+            [In] double[] observationConfidences,
             int pointCount,
+            int basePointCount,
+            [In] int[] lineIds,
+            [In] LineObservation[] lineObservations,
+            [In] byte[] lineObservationVisibility,
+            int lineCount,
             ref SolveOptions options,
             [In, Out] CameraOutput[] cameraOutputs,
             [In, Out] PointOutput[] pointOutputs,
+            [In, Out] LineOutput[] lineOutputs,
             out SolveReport report,
             StringBuilder errorBuffer,
             int errorBufferCapacity);
@@ -112,24 +148,41 @@ namespace ReconstructionTool.Editor
         internal static Status Solve(
             CameraInput[] cameras,
             int[] pointIds,
+            int basePointCount,
             Observation[] observations,
+            byte[] observationVisibility,
+            double[] observationConfidences,
+            int[] lineIds,
+            LineObservation[] lineObservations,
+            byte[] lineObservationVisibility,
             SolveOptions options,
             out CameraOutput[] cameraOutputs,
             out PointOutput[] pointOutputs,
+            out LineOutput[] lineOutputs,
             out SolveReport report,
             out string error)
         {
-            cameraOutputs = new CameraOutput[3];
+            cameraOutputs = new CameraOutput[cameras.Length];
             pointOutputs = new PointOutput[pointIds.Length];
-            StringBuilder buffer = new(4096);
-            int status = RT_SolveThreeView(
+            lineOutputs = new LineOutput[lineIds.Length];
+            StringBuilder buffer = new(32768);
+            int status = RT_SolveMultiView(
                 cameras,
+                cameras.Length,
                 pointIds,
                 observations,
+                observationVisibility,
+                observationConfidences,
                 pointIds.Length,
+                basePointCount,
+                lineIds,
+                lineObservations,
+                lineObservationVisibility,
+                lineIds.Length,
                 ref options,
                 cameraOutputs,
                 pointOutputs,
+                lineOutputs,
                 out report,
                 buffer,
                 buffer.Capacity);

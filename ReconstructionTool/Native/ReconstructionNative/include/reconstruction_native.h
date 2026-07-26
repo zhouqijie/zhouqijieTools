@@ -30,11 +30,21 @@ struct RT_CameraInput {
     std::int32_t height;
     double min_vertical_fov_degrees;
     double max_vertical_fov_degrees;
+    double confidence;
+    std::int32_t pose_only;
 };
 
 struct RT_Observation {
     double x;
     double y;
+};
+
+struct RT_LineObservation {
+    double start_x;
+    double start_y;
+    double end_x;
+    double end_y;
+    double confidence;
 };
 
 struct RT_SolveOptions {
@@ -61,26 +71,44 @@ struct RT_PointOutput {
     double reprojection_rms_pixels;
 };
 
+struct RT_LineOutput {
+    std::int32_t id;
+    double point[3];
+    double direction[3];
+    double reprojection_rms_pixels;
+};
+
 struct RT_SolveReport {
     std::int32_t status;
     std::int32_t point_count;
     std::int32_t inlier_count;
+    std::int32_t line_count;
     double normalized_reprojection_rms;
+    double normalized_line_rms;
     double median_triangulation_angle_degrees;
     double applied_scale;
 };
 
 RT_API const char *RT_CALL RT_GetVersion();
 
-// observations are camera-major: observations[camera_index * point_count + point_index].
-RT_API std::int32_t RT_CALL RT_SolveThreeView(
+// Point and line observations are camera-major.
+RT_API std::int32_t RT_CALL RT_SolveMultiView(
     const RT_CameraInput *cameras,
+    std::int32_t camera_count,
     const std::int32_t *point_ids,
     const RT_Observation *observations,
+    const std::uint8_t *observation_visibility,
+    const double *observation_confidences,
     std::int32_t point_count,
+    std::int32_t base_point_count,
+    const std::int32_t *line_ids,
+    const RT_LineObservation *line_observations,
+    const std::uint8_t *line_observation_visibility,
+    std::int32_t line_count,
     const RT_SolveOptions *options,
     RT_CameraOutput *camera_outputs,
     RT_PointOutput *point_outputs,
+    RT_LineOutput *line_outputs,
     RT_SolveReport *report,
     char *error_buffer,
     std::int32_t error_buffer_capacity);

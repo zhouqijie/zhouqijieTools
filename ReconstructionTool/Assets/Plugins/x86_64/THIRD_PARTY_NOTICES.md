@@ -1,6 +1,6 @@
 # Third-party notices
 
-`ReconstructionNative.dll` statically links the following open-source projects.
+`ReconstructionNative_1_8.dll` statically links the following open-source projects.
 
 ## PoseLib 2.0.5
 

@@ -10,7 +10,14 @@ namespace ReconstructionTool.Editor
         internal RefPicture[] Pictures { get; }
         internal ReconstructionNativeApi.CameraInput[] Cameras { get; }
         internal int[] PointIds { get; }
+        internal int BasePointCount { get; }
         internal ReconstructionNativeApi.Observation[] Observations { get; }
+        internal byte[] ObservationVisibility { get; }
+        internal double[] ObservationConfidences { get; }
+        internal int[] LineIds { get; }
+        internal ReconstructionNativeApi.LineObservation[] LineObservations { get; }
+        internal byte[] LineObservationVisibility { get; }
+        internal int? ResultXAxisLineId { get; }
         internal ReconstructionNativeApi.SolveOptions Options { get; }
         internal string Warning { get; }
 
@@ -18,14 +25,28 @@ namespace ReconstructionTool.Editor
             RefPicture[] pictures,
             ReconstructionNativeApi.CameraInput[] cameras,
             int[] pointIds,
+            int basePointCount,
             ReconstructionNativeApi.Observation[] observations,
+            byte[] observationVisibility,
+            double[] observationConfidences,
+            int[] lineIds,
+            ReconstructionNativeApi.LineObservation[] lineObservations,
+            byte[] lineObservationVisibility,
+            int? resultXAxisLineId,
             ReconstructionNativeApi.SolveOptions options,
             string warning)
         {
             Pictures = pictures;
             Cameras = cameras;
             PointIds = pointIds;
+            BasePointCount = basePointCount;
             Observations = observations;
+            ObservationVisibility = observationVisibility;
+            ObservationConfidences = observationConfidences;
+            LineIds = lineIds;
+            LineObservations = lineObservations;
+            LineObservationVisibility = lineObservationVisibility;
+            ResultXAxisLineId = resultXAxisLineId;
             Options = options;
             Warning = warning;
         }
@@ -42,22 +63,43 @@ namespace ReconstructionTool.Editor
                 .FindObjectsByType<RefPicture>(FindObjectsInactive.Include, FindObjectsSortMode.None)
                 .Where(picture => picture.gameObject.scene.IsValid())
                 .ToArray();
-            if (pictures.Length != 3)
+            if (pictures.Length < 3)
             {
-                error = $"场景中必须恰好有 3 个 RefPicture，当前找到 {pictures.Length} 个。";
+                error = $"场景中至少需要 3 个 RefPicture，当前找到 {pictures.Length} 个。";
+                return false;
+            }
+            if (pictures.Length > 64)
+            {
+                error = $"最多支持 64 个 RefPicture，当前找到 {pictures.Length} 个。";
                 return false;
             }
 
-            if (pictures.Select(picture => picture.CameraId).Distinct().Count() != 3 ||
-                pictures.Any(picture => picture.CameraId is < 0 or > 2))
+            if (pictures.Select(picture => picture.CameraId).Distinct().Count() != pictures.Length ||
+                pictures.Any(picture => picture.CameraId < 0))
             {
-                error = "三个 RefPicture 的 CameraId 必须唯一且正好为 0、1、2。";
+                error = "所有 RefPicture 的 Camera ID 必须是唯一的非负整数。";
                 return false;
             }
 
             Array.Sort(pictures, (left, right) => left.CameraId.CompareTo(right.CameraId));
-            var pointMaps = new Dictionary<int, RefPoint2D>[3];
-            for (int cameraIndex = 0; cameraIndex < 3; cameraIndex++)
+            for (int cameraIndex = 0; cameraIndex < pictures.Length; cameraIndex++)
+            {
+                if (pictures[cameraIndex].CameraId != cameraIndex)
+                {
+                    error = $"Camera ID 必须从 0 连续编号到 {pictures.Length - 1}，" +
+                            $"当前缺少 ID {cameraIndex}。";
+                    return false;
+                }
+            }
+            if (pictures.Take(3).Any(picture => picture.CameraPoseOnly))
+            {
+                error = "Camera 0～2 是基础三视图，不能设为“仅求相机位姿”。";
+                return false;
+            }
+
+            var pointMaps = new Dictionary<int, RefPoint2D>[pictures.Length];
+            var lineMaps = new Dictionary<int, RefLine2D>[pictures.Length];
+            for (int cameraIndex = 0; cameraIndex < pictures.Length; cameraIndex++)
             {
                 RefPicture picture = pictures[cameraIndex];
                 if (!TryGetPictureSize(picture, out int width, out int height, out error))
@@ -84,23 +126,141 @@ namespace ReconstructionTool.Editor
                         return false;
                     }
                 }
+
+                lineMaps[cameraIndex] = new Dictionary<int, RefLine2D>();
+                foreach (RefLine2D line in picture.GetComponentsInChildren<RefLine2D>(true))
+                {
+                    if (!lineMaps[cameraIndex].TryAdd(line.Id, line))
+                    {
+                        error = $"Camera {cameraIndex} 中 RefLine2D ID {line.Id} 重复。";
+                        return false;
+                    }
+
+                    line.GetWorldEndpoints(out Vector3 worldStart, out Vector3 worldEnd);
+                    Vector2 start = WorldToTopLeftPixel(picture.RectTransform, worldStart);
+                    Vector2 end = WorldToTopLeftPixel(picture.RectTransform, worldEnd);
+                    float normalizedLength =
+                        Vector2.Distance(start, end) * 1000f / Mathf.Max(width, height);
+                    if (normalizedLength < 20f)
+                    {
+                        error = $"Camera {cameraIndex} 的参考线 ID {line.Id} 操作段太短。" +
+                                "请把 RefLine2D 的 RectTransform 宽度拉长，使方向更容易准确对齐。";
+                        return false;
+                    }
+                    if (!LineIntersectsPicture(start, end, width, height))
+                    {
+                        error = $"Camera {cameraIndex} 的参考线 ID {line.Id} 没有穿过图片。" +
+                                "请把粉色虚线移动到实际可见的直边上。";
+                        return false;
+                    }
+                }
             }
 
-            int[] pointIds = pointMaps[0].Keys.OrderBy(id => id).ToArray();
-            if (pointIds.Length < 8)
+            int[] basePointIds = pointMaps[0].Keys.OrderBy(id => id).ToArray();
+            if (basePointIds.Length < 8)
             {
-                error = $"至少需要 8 个共同参考点，当前只有 {pointIds.Length} 个。";
+                error = $"至少需要 8 个共同参考点，当前只有 {basePointIds.Length} 个。";
                 return false;
             }
 
             for (int cameraIndex = 1; cameraIndex < 3; cameraIndex++)
             {
-                if (!pointIds.SequenceEqual(pointMaps[cameraIndex].Keys.OrderBy(id => id)))
+                if (!basePointIds.SequenceEqual(pointMaps[cameraIndex].Keys.OrderBy(id => id)))
                 {
                     error = $"Camera {cameraIndex} 的 RefPoint2D ID 集合与 Camera 0 不一致。";
                     return false;
                 }
             }
+
+            var basePointIdSet = new HashSet<int>(basePointIds);
+            for (int cameraIndex = 3; cameraIndex < pictures.Length; cameraIndex++)
+            {
+                int visibleBasePointCount =
+                    pointMaps[cameraIndex].Keys.Count(basePointIdSet.Contains);
+                if (visibleBasePointCount < 4)
+                {
+                    error = $"附加 Camera {cameraIndex} 至少需要标出 4 个基础参考点，" +
+                            $"当前只有 {visibleBasePointCount} 个；附加新点不能用于初始化相机。";
+                    return false;
+                }
+            }
+
+            int[] reconstructionAdditionalCameras = Enumerable
+                .Range(3, pictures.Length - 3)
+                .Where(cameraIndex => !pictures[cameraIndex].CameraPoseOnly)
+                .ToArray();
+            int[] additionalPointIds = reconstructionAdditionalCameras
+                .SelectMany(cameraIndex => pointMaps[cameraIndex].Keys)
+                .Where(id => !basePointIdSet.Contains(id))
+                .Distinct()
+                .OrderBy(id => id)
+                .ToArray();
+            foreach (int pointId in additionalPointIds)
+            {
+                int visibleAdditionalCameras = reconstructionAdditionalCameras
+                    .Count(cameraIndex => pointMaps[cameraIndex].ContainsKey(pointId));
+                if (visibleAdditionalCameras < 2)
+                {
+                    error = $"附加参考点 ID {pointId} 只在 {visibleAdditionalCameras} 个附加机位中可见。" +
+                            "它至少需要被两个附加机位使用相同 ID 标记，" +
+                            "且这两个机位都必须参与公共重建，才能恢复三维位置。";
+                    return false;
+                }
+            }
+            int[] pointIds = basePointIds.Concat(additionalPointIds).ToArray();
+            var reconstructedPointIdSet = new HashSet<int>(pointIds);
+            for (int cameraIndex = 3; cameraIndex < pictures.Length; cameraIndex++)
+            {
+                if (!pictures[cameraIndex].CameraPoseOnly)
+                {
+                    continue;
+                }
+                int unknownPointId = pointMaps[cameraIndex].Keys.FirstOrDefault(
+                    id => !reconstructedPointIdSet.Contains(id));
+                if (pointMaps[cameraIndex].Keys.Any(id => !reconstructedPointIdSet.Contains(id)))
+                {
+                    error = $"仅求相机位姿的 Camera {cameraIndex} 使用了点 ID {unknownPointId}，" +
+                            "但该点尚未由参与公共重建的机位生成。";
+                    return false;
+                }
+            }
+
+            int[] lineIds = lineMaps[0].Keys.OrderBy(id => id).ToArray();
+            for (int cameraIndex = 1; cameraIndex < 3; cameraIndex++)
+            {
+                if (!lineIds.SequenceEqual(lineMaps[cameraIndex].Keys.OrderBy(id => id)))
+                {
+                    error = $"Camera {cameraIndex} 的 RefLine2D ID 集合与 Camera 0 不一致。";
+                    return false;
+                }
+            }
+
+            for (int cameraIndex = 3; cameraIndex < pictures.Length; cameraIndex++)
+            {
+                int unknownLineId = lineMaps[cameraIndex].Keys.FirstOrDefault(
+                    id => Array.BinarySearch(lineIds, id) < 0);
+                if (lineMaps[cameraIndex].Keys.Any(id => Array.BinarySearch(lineIds, id) < 0))
+                {
+                    error = $"附加 Camera {cameraIndex} 的参考线 ID {unknownLineId} " +
+                            "不在 Camera 0～2 的基础参考线集中。";
+                    return false;
+                }
+            }
+
+            int[] resultXAxisLineIds = lineMaps
+                .SelectMany(map => map.Values)
+                .Where(line => line.UseAsResultXAxis)
+                .Select(line => line.Id)
+                .Distinct()
+                .ToArray();
+            if (resultXAxisLineIds.Length > 1)
+            {
+                error = "只能指定一个参考线 Line ID 作为结果 X 轴。";
+                return false;
+            }
+            int? resultXAxisLineId = resultXAxisLineIds.Length == 1
+                ? resultXAxisLineIds[0]
+                : null;
 
             RefPicture scalePicture = pictures[0];
             if (scalePicture.ScalePointIdA == scalePicture.ScalePointIdB)
@@ -120,9 +280,15 @@ namespace ReconstructionTool.Editor
                 return false;
             }
 
-            var cameras = new ReconstructionNativeApi.CameraInput[3];
-            var observations = new ReconstructionNativeApi.Observation[3 * pointIds.Length];
-            for (int cameraIndex = 0; cameraIndex < 3; cameraIndex++)
+            var cameras = new ReconstructionNativeApi.CameraInput[pictures.Length];
+            var observations =
+                new ReconstructionNativeApi.Observation[pictures.Length * pointIds.Length];
+            var observationVisibility = new byte[observations.Length];
+            var observationConfidences = new double[observations.Length];
+            var lineObservations =
+                new ReconstructionNativeApi.LineObservation[pictures.Length * lineIds.Length];
+            var lineObservationVisibility = new byte[lineObservations.Length];
+            for (int cameraIndex = 0; cameraIndex < pictures.Length; cameraIndex++)
             {
                 RefPicture picture = pictures[cameraIndex];
                 TryGetPictureSize(picture, out int width, out int height, out _);
@@ -131,15 +297,49 @@ namespace ReconstructionTool.Editor
                     Width = width,
                     Height = height,
                     MinimumVerticalFov = picture.MinimumVerticalFov,
-                    MaximumVerticalFov = picture.MaximumVerticalFov
+                    MaximumVerticalFov = picture.MaximumVerticalFov,
+                    Confidence = picture.Confidence,
+                    PoseOnly = picture.CameraPoseOnly ? 1 : 0
                 };
 
                 for (int pointIndex = 0; pointIndex < pointIds.Length; pointIndex++)
                 {
-                    RefPoint2D point = pointMaps[cameraIndex][pointIds[pointIndex]];
+                    if (!pointMaps[cameraIndex].TryGetValue(
+                            pointIds[pointIndex],
+                            out RefPoint2D point))
+                    {
+                        continue;
+                    }
                     Vector2 pixel = WorldToTopLeftPixel(picture.RectTransform, point.transform.position);
-                    observations[cameraIndex * pointIds.Length + pointIndex] =
+                    int observationIndex = cameraIndex * pointIds.Length + pointIndex;
+                    observations[observationIndex] =
                         new ReconstructionNativeApi.Observation { X = pixel.x, Y = pixel.y };
+                    observationVisibility[observationIndex] = 1;
+                    observationConfidences[observationIndex] = point.Confidence;
+                }
+
+                for (int lineIndex = 0; lineIndex < lineIds.Length; lineIndex++)
+                {
+                    if (!lineMaps[cameraIndex].TryGetValue(
+                            lineIds[lineIndex],
+                            out RefLine2D line))
+                    {
+                        continue;
+                    }
+                    line.GetWorldEndpoints(out Vector3 worldStart, out Vector3 worldEnd);
+                    Vector2 start = WorldToTopLeftPixel(picture.RectTransform, worldStart);
+                    Vector2 end = WorldToTopLeftPixel(picture.RectTransform, worldEnd);
+                    int observationIndex = cameraIndex * lineIds.Length + lineIndex;
+                    lineObservations[observationIndex] =
+                        new ReconstructionNativeApi.LineObservation
+                        {
+                            StartX = start.x,
+                            StartY = start.y,
+                            EndX = end.x,
+                            EndY = end.y,
+                            Confidence = line.Confidence
+                        };
+                    lineObservationVisibility[observationIndex] = 1;
                 }
             }
 
@@ -148,14 +348,60 @@ namespace ReconstructionTool.Editor
                 ScalePointIdA = scalePicture.ScalePointIdA,
                 ScalePointIdB = scalePicture.ScalePointIdB,
                 KnownScaleDistance = scalePicture.ScaleReferenceDistance,
-                MaximumNormalizedReprojectionError = 1.5,
+                MaximumNormalizedReprojectionError =
+                    scalePicture.MaximumNormalizedReprojectionError,
                 RandomSeed = 1337,
                 MaximumCandidates = 12
             };
-            string warning = pointIds.Length < 15
-                ? $"只有 {pointIds.Length} 个共同点，结果可能不稳定；建议使用至少 15 个非共面点。"
+            string warning = basePointIds.Length < 15
+                ? $"只有 {basePointIds.Length} 个共同基础点，结果可能不稳定；建议使用至少 15 个非共面点。"
                 : string.Empty;
-            input = new ReconstructionInput(pictures, cameras, pointIds, observations, options, warning);
+            if (pictures.Length > 3)
+            {
+                warning += (warning.Length > 0 ? "\n" : string.Empty) +
+                           $"已启用 {pictures.Length - 3} 个附加稀疏机位；" +
+                           "它们只使用各自实际标出的基础点和参考线。";
+                int[] minimumPointCameras = Enumerable
+                    .Range(3, pictures.Length - 3)
+                    .Where(cameraIndex =>
+                        pointMaps[cameraIndex].Keys.Count(basePointIdSet.Contains) < 6)
+                    .ToArray();
+                if (minimumPointCameras.Length > 0)
+                {
+                    warning += "\n附加 Camera " + string.Join(", ", minimumPointCameras) +
+                               " 只有 4～5 个可见点，正在使用最小解模式；" +
+                               "请尽量让点分散，并在条件允许时增加到 6 个以上。";
+                }
+                if (additionalPointIds.Length > 0)
+                {
+                    warning += $"\n将从附加机位共同观测中生成 {additionalPointIds.Length} 个新增三维点；" +
+                               "这些点不计入附加相机初始化所需的 4 个基础点。";
+                }
+                int[] poseOnlyCameras = Enumerable
+                    .Range(3, pictures.Length - 3)
+                    .Where(cameraIndex => pictures[cameraIndex].CameraPoseOnly)
+                    .ToArray();
+                if (poseOnlyCameras.Length > 0)
+                {
+                    warning += "\nCamera " + string.Join(", ", poseOnlyCameras) +
+                               " 仅求相机位姿：公共三维结构固定后，" +
+                               "它们的参考点和参考线只用于计算各自的位置、旋转和 FOV。";
+                }
+            }
+            input = new ReconstructionInput(
+                pictures,
+                cameras,
+                pointIds,
+                basePointIds.Length,
+                observations,
+                observationVisibility,
+                observationConfidences,
+                lineIds,
+                lineObservations,
+                lineObservationVisibility,
+                resultXAxisLineId,
+                options,
+                warning);
             return true;
         }
 
@@ -164,6 +410,25 @@ namespace ReconstructionTool.Editor
             Vector3 local = picture.InverseTransformPoint(worldPosition);
             Rect rect = picture.rect;
             return new Vector2(local.x - rect.xMin, rect.yMax - local.y);
+        }
+
+        /// <summary> 判断二维无限直线是否穿过图片矩形。 </summary>
+        private static bool LineIntersectsPicture(
+            Vector2 start,
+            Vector2 end,
+            int width,
+            int height)
+        {
+            float a = start.y - end.y;
+            float b = end.x - start.x;
+            float c = start.x * end.y - end.x * start.y;
+            float value0 = c;
+            float value1 = a * width + c;
+            float value2 = b * height + c;
+            float value3 = a * width + b * height + c;
+            float minimum = Mathf.Min(value0, value1, value2, value3);
+            float maximum = Mathf.Max(value0, value1, value2, value3);
+            return minimum <= 0f && maximum >= 0f;
         }
 
         private static bool TryGetPictureSize(

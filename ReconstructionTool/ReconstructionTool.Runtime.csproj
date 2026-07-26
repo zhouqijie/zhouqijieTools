@@ -43,20 +43,25 @@
     <UnityVersion>6000.3.15f1</UnityVersion>
   </PropertyGroup>
   <ItemGroup>
-    <Analyzer Include="C:\Program Files\Microsoft Visual Studio\18\Community\Common7\IDE\Extensions\Microsoft\Visual Studio Tools for Unity\Analyzers\Microsoft.Unity.Analyzers.dll" />
+    <Analyzer Include="E:\DevTools\Visual Studio 2026\Common7\IDE\Extensions\Microsoft\Visual Studio Tools for Unity\Analyzers\Microsoft.Unity.Analyzers.dll" />
     <Analyzer Include="C:\Program Files\Unity\Hub\Editor\6000.3.15f1\Editor\Data\Tools\BuildPipeline\Unity.SourceGenerators\Unity.SourceGenerators.dll" />
     <Analyzer Include="C:\Program Files\Unity\Hub\Editor\6000.3.15f1\Editor\Data\Tools\BuildPipeline\Unity.SourceGenerators\Unity.Properties.SourceGenerator.dll" />
     <Analyzer Include="C:\Program Files\Unity\Hub\Editor\6000.3.15f1\Editor\Data\Tools\BuildPipeline\Unity.SourceGenerators\Unity.UIToolkit.SourceGenerator.dll" />
   </ItemGroup>
   <ItemGroup>
-    <Compile Include="Assets\ReconstructionTool\Runtime\ReconstructionResult.cs" />
+    <Compile Include="Assets\ReconstructionTool\Runtime\RawImageLensDistortionCorrector.cs" />
+    <Compile Include="Assets\ReconstructionTool\Runtime\RefPointConnection3D.cs" />
+    <Compile Include="Assets\ReconstructionTool\Runtime\RefPointConnection.cs" />
+    <Compile Include="Assets\ReconstructionTool\Runtime\RefLine3D.cs" />
     <Compile Include="Assets\ReconstructionTool\Runtime\CameraPoint3D.cs" />
     <Compile Include="Assets\ReconstructionTool\Runtime\RefPoint3D.cs" />
     <Compile Include="Assets\ReconstructionTool\Runtime\RefPicture.cs" />
     <Compile Include="Assets\ReconstructionTool\Runtime\RefPoint2D.cs" />
+    <Compile Include="Assets\ReconstructionTool\Runtime\RefLine2D.cs" />
   </ItemGroup>
   <ItemGroup>
     <None Include="Assets\ReconstructionTool\Runtime\ReconstructionTool.Runtime.asmdef" />
+    <None Include="Assets\ReconstructionTool\Runtime\Resources\RawImageLensDistortionCorrection.shader" />
   </ItemGroup>
   <ItemGroup>
     <Reference Include="UnityEngine">
@@ -1151,10 +1156,16 @@
       <HintPath>C:\Program Files\Unity\Hub\Editor\6000.3.15f1\Editor\Data\NetStandard\compat\2.1.0\shims\netfx\System.Xml.Serialization.dll</HintPath>
       <Private>False</Private>
     </Reference>
+    <Reference Include="UnityEngine.UI">
+      <HintPath>Library\ScriptAssemblies\UnityEngine.UI.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
+    <Reference Include="UnityEditor.UI">
+      <HintPath>Library\ScriptAssemblies\UnityEditor.UI.dll</HintPath>
+      <Private>False</Private>
+    </Reference>
   </ItemGroup>
   <ItemGroup>
-    <ProjectReference Include="UnityEngine.UI.csproj" />
-    <ProjectReference Include="UnityEditor.UI.csproj" />
   </ItemGroup>
   <Import Project="Sdk.targets" Sdk="Microsoft.NET.Sdk" />
   <ItemGroup>

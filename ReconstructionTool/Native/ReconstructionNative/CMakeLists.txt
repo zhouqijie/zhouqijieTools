@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.24)
 
-project(ReconstructionNative VERSION 1.0.0 LANGUAGES CXX)
+project(ReconstructionNative VERSION 1.8.0 LANGUAGES CXX)
 
 include(FetchContent)
 
@@ -73,7 +73,7 @@ target_compile_definitions(ReconstructionNative PRIVATE RECONSTRUCTION_NATIVE_EX
 
 if(MSVC)
     target_compile_options(ReconstructionNative PRIVATE
-        /W4 /EHsc /permissive- /bigobj
+        /W4 /EHsc /permissive- /bigobj /utf-8
         $<$<CONFIG:Release>:/Zi>
     )
     target_link_options(ReconstructionNative PRIVATE
@@ -84,7 +84,7 @@ if(MSVC)
 endif()
 
 set_target_properties(ReconstructionNative PROPERTIES
-    OUTPUT_NAME "ReconstructionNative"
+    OUTPUT_NAME "ReconstructionNative_1_8"
 )
 
 option(RECONSTRUCTION_BUILD_TESTS "Build the native synthetic tests." ON)
@@ -94,5 +94,8 @@ if(RECONSTRUCTION_BUILD_TESTS)
         tests/reconstruction_native_tests.cpp
     )
     target_link_libraries(ReconstructionNativeTests PRIVATE ReconstructionNative Eigen3::Eigen)
+    if(MSVC)
+        target_compile_options(ReconstructionNativeTests PRIVATE /utf-8)
+    endif()
     add_test(NAME ReconstructionNativeSynthetic COMMAND ReconstructionNativeTests)
 endif()

@@ -9,6 +9,7 @@ $ErrorActionPreference = 'Stop'
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $buildRoot = Join-Path $scriptRoot '.native-build'
 $resolvedOutput = [System.IO.Path]::GetFullPath((Join-Path $scriptRoot $OutputDirectory))
+$pluginBaseName = 'ReconstructionNative_1_8'
 
 $vswhere = 'C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe'
 if (-not (Test-Path -LiteralPath $vswhere)) {
@@ -57,15 +58,20 @@ if ($LASTEXITCODE -ne 0) {
     throw 'Native build failed.'
 }
 
-& $cmake --build $buildRoot --config $Configuration --target RUN_TESTS
+$testExecutable = Join-Path $buildRoot "$Configuration\ReconstructionNativeTests.exe"
+if (-not (Test-Path -LiteralPath $testExecutable)) {
+    throw "Native test executable was not found at $testExecutable"
+}
+
+& $testExecutable
 if ($LASTEXITCODE -ne 0) {
     throw 'Native tests failed.'
 }
 
 New-Item -ItemType Directory -Force -Path $resolvedOutput | Out-Null
-Copy-Item -Force -LiteralPath (Join-Path $buildRoot "$Configuration\ReconstructionNative.dll") -Destination $resolvedOutput
+Copy-Item -Force -LiteralPath (Join-Path $buildRoot "$Configuration\$pluginBaseName.dll") -Destination $resolvedOutput
 
-$pdb = Join-Path $buildRoot "$Configuration\ReconstructionNative.pdb"
+$pdb = Join-Path $buildRoot "$Configuration\$pluginBaseName.pdb"
 if (Test-Path -LiteralPath $pdb) {
     Copy-Item -Force -LiteralPath $pdb -Destination $resolvedOutput
 }

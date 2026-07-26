@@ -9,6 +9,8 @@
 #include <ceres/sphere_manifold.h>
 
 #include <Eigen/Core>
+#include <Eigen/Cholesky>
+#include <Eigen/Eigenvalues>
 #include <Eigen/Geometry>
 #include <Eigen/SVD>
 
@@ -16,6 +18,7 @@
 #include <array>
 #include <cmath>
 #include <cstring>
+#include <iomanip>
 #include <limits>
 #include <numeric>
 #include <random>
@@ -29,14 +32,17 @@
 
 namespace {
 
-constexpr int kCameraCount = 3;
+constexpr int kBaseCameraCount = 3;
+constexpr int kMaximumCameraCount = 64;
 constexpr double kNormalizedLongSide = 1000.0;
 constexpr double kPi = 3.14159265358979323846;
 
 using Vec2 = Eigen::Vector2d;
 using Vec3 = Eigen::Vector3d;
 using Mat3 = Eigen::Matrix3d;
-using PoseArray = std::array<poselib::CameraPose, kCameraCount>;
+using PointObservationList = std::vector<std::vector<Vec2>>;
+using VisibilityList = std::vector<std::vector<char>>;
+using PointConfidenceList = std::vector<std::vector<double>>;
 
 struct NormalizedCamera {
     double width = 0.0;
@@ -46,6 +52,8 @@ struct NormalizedCamera {
     double max_focal = 0.0;
     double min_fov = 0.0;
     double max_fov = 0.0;
+    double confidence = 1.0;
+    bool pose_only = false;
     Vec2 principal = Vec2::Zero();
 };
 
@@ -58,12 +66,28 @@ struct PairGeometry {
     double fundamental_score = std::numeric_limits<double>::max();
 };
 
+struct NormalizedLineObservation {
+    Vec3 equation = Vec3::Zero();
+    double confidence = 1.0;
+};
+
+using CameraList = std::vector<NormalizedCamera>;
+using LineObservationList = std::vector<std::vector<NormalizedLineObservation>>;
+
+struct Line3D {
+    Vec3 point = Vec3::Zero();
+    Vec3 direction = Vec3::UnitX();
+    double sample_extent = 1.0;
+};
+
 struct Candidate {
-    PoseArray poses;
-    std::array<double, kCameraCount> focals{};
+    std::vector<poselib::CameraPose> poses;
+    std::vector<double> focals;
     std::vector<Vec3> points;
+    std::vector<Line3D> lines;
     double score = std::numeric_limits<double>::max();
     double rms = std::numeric_limits<double>::max();
+    double line_rms = 0.0;
     double median_angle = 0.0;
     bool optimized = false;
 };
@@ -169,6 +193,30 @@ double ReprojectionSquared(
     return (projected - observation).squaredNorm();
 }
 
+std::array<double, 2> LineResiduals(
+    const Line3D &line,
+    const NormalizedLineObservation &observation,
+    const NormalizedCamera &camera,
+    const double focal,
+    const poselib::CameraPose &pose) {
+    std::array<double, 2> residuals{};
+    for (int endpoint = 0; endpoint < 2; ++endpoint) {
+        const double offset = endpoint == 0 ? -line.sample_extent : line.sample_extent;
+        const Vec3 camera_point = pose.apply(line.point + offset * line.direction);
+        if (!camera_point.allFinite() || camera_point.z() <= 1e-8) {
+            residuals[endpoint] = 1e6;
+            continue;
+        }
+        const double projected_x =
+            focal * camera_point.x() / camera_point.z() + camera.principal.x();
+        const double projected_y =
+            focal * camera_point.y() / camera_point.z() + camera.principal.y();
+        residuals[endpoint] =
+            observation.equation.dot(Vec3(projected_x, projected_y, 1.0));
+    }
+    return residuals;
+}
+
 double Median(std::vector<double> values) {
     if (values.empty()) {
         return 0.0;
@@ -183,20 +231,25 @@ double Median(std::vector<double> values) {
     return result;
 }
 
-double ComputeMedianTriangulationAngle(const PoseArray &poses, const std::vector<Vec3> &points) {
-    std::array<Vec3, kCameraCount> centers{};
-    for (int camera_index = 0; camera_index < kCameraCount; ++camera_index) {
-        centers[camera_index] = poses[camera_index].center();
-    }
-
+double ComputeMedianTriangulationAngle(
+    const std::vector<poselib::CameraPose> &poses,
+    const std::vector<Vec3> &points,
+    const VisibilityList &visibility,
+    const CameraList &cameras) {
     std::vector<double> angles;
     angles.reserve(points.size());
-    for (const Vec3 &point : points) {
+    for (std::size_t point_index = 0; point_index < points.size(); ++point_index) {
         double maximum_angle = 0.0;
-        for (int first = 0; first < kCameraCount; ++first) {
-            for (int second = first + 1; second < kCameraCount; ++second) {
-                const Vec3 ray1 = (point - centers[first]).normalized();
-                const Vec3 ray2 = (point - centers[second]).normalized();
+        for (std::size_t first = 0; first < poses.size(); ++first) {
+            if (cameras[first].pose_only || !visibility[first][point_index]) {
+                continue;
+            }
+            for (std::size_t second = first + 1; second < poses.size(); ++second) {
+                if (cameras[second].pose_only || !visibility[second][point_index]) {
+                    continue;
+                }
+                const Vec3 ray1 = (points[point_index] - poses[first].center()).normalized();
+                const Vec3 ray2 = (points[point_index] - poses[second].center()).normalized();
                 const double cosine = std::clamp(ray1.dot(ray2), -1.0, 1.0);
                 maximum_angle = std::max(maximum_angle, RadiansToDegrees(std::acos(cosine)));
             }
@@ -208,31 +261,205 @@ double ComputeMedianTriangulationAngle(const PoseArray &poses, const std::vector
 
 double ScoreCandidate(
     const Candidate &candidate,
-    const std::array<NormalizedCamera, kCameraCount> &cameras,
-    const std::array<std::vector<Vec2>, kCameraCount> &observations,
-    int *positive_count = nullptr) {
+    const CameraList &cameras,
+    const PointObservationList &observations,
+    const VisibilityList &visibility,
+    const PointConfidenceList &point_confidences,
+    int *positive_count = nullptr,
+    int *visible_count = nullptr) {
     double squared_sum = 0.0;
+    double weight_sum = 0.0;
     int positive = 0;
-    int residual_count = 0;
+    int visible = 0;
     for (std::size_t point_index = 0; point_index < candidate.points.size(); ++point_index) {
-        for (int camera_index = 0; camera_index < kCameraCount; ++camera_index) {
+        for (std::size_t camera_index = 0; camera_index < candidate.poses.size(); ++camera_index) {
+            if (cameras[camera_index].pose_only ||
+                !visibility[camera_index][point_index]) {
+                continue;
+            }
+            visible++;
             bool is_positive = false;
-            squared_sum += ReprojectionSquared(
-                candidate.points[point_index],
-                observations[camera_index][point_index],
-                cameras[camera_index],
-                candidate.focals[camera_index],
-                candidate.poses[camera_index],
-                &is_positive);
+            const double confidence =
+                cameras[camera_index].confidence *
+                point_confidences[camera_index][point_index];
+            squared_sum += confidence *
+                           ReprojectionSquared(
+                               candidate.points[point_index],
+                               observations[camera_index][point_index],
+                               cameras[camera_index],
+                               candidate.focals[camera_index],
+                               candidate.poses[camera_index],
+                               &is_positive);
             positive += is_positive ? 1 : 0;
-            residual_count += 2;
+            weight_sum += confidence;
         }
     }
 
     if (positive_count != nullptr) {
         *positive_count = positive;
     }
-    return std::sqrt(squared_sum / std::max(1, residual_count));
+    if (visible_count != nullptr) {
+        *visible_count = visible;
+    }
+    return std::sqrt(squared_sum / std::max(1e-8, weight_sum * 2.0));
+}
+
+double ScoreLines(
+    const Candidate &candidate,
+    const CameraList &cameras,
+    const LineObservationList &observations,
+    const VisibilityList &visibility,
+    double *weighted_squared_sum = nullptr,
+    double *weight_sum = nullptr) {
+    double squared_sum = 0.0;
+    double weights = 0.0;
+    for (std::size_t line_index = 0; line_index < candidate.lines.size(); ++line_index) {
+        for (std::size_t camera_index = 0; camera_index < candidate.poses.size(); ++camera_index) {
+            if (cameras[camera_index].pose_only ||
+                !visibility[camera_index][line_index]) {
+                continue;
+            }
+            const NormalizedLineObservation &observation =
+                observations[camera_index][line_index];
+            const double confidence =
+                cameras[camera_index].confidence * observation.confidence;
+            const auto residuals = LineResiduals(
+                candidate.lines[line_index],
+                observation,
+                cameras[camera_index],
+                candidate.focals[camera_index],
+                candidate.poses[camera_index]);
+            squared_sum += confidence *
+                           (residuals[0] * residuals[0] + residuals[1] * residuals[1]);
+            weights += confidence;
+        }
+    }
+    if (weighted_squared_sum != nullptr) {
+        *weighted_squared_sum = squared_sum;
+    }
+    if (weight_sum != nullptr) {
+        *weight_sum = weights;
+    }
+    return candidate.lines.empty()
+               ? 0.0
+               : std::sqrt(squared_sum / std::max(1e-8, weights * 2.0));
+}
+
+double CombinedCandidateScore(
+    const Candidate &candidate,
+    const CameraList &cameras,
+    const VisibilityList &point_visibility,
+    const PointConfidenceList &point_confidences,
+    const LineObservationList &line_observations,
+    const VisibilityList &line_visibility) {
+    double point_weight = 0.0;
+    for (std::size_t camera_index = 0; camera_index < candidate.poses.size(); ++camera_index) {
+        if (cameras[camera_index].pose_only) {
+            continue;
+        }
+        for (std::size_t point_index = 0; point_index < candidate.points.size(); ++point_index) {
+            if (point_visibility[camera_index][point_index]) {
+                point_weight +=
+                    cameras[camera_index].confidence *
+                    point_confidences[camera_index][point_index];
+            }
+        }
+    }
+    double line_squared_sum = 0.0;
+    double line_weight = 0.0;
+    ScoreLines(
+        candidate,
+        cameras,
+        line_observations,
+        line_visibility,
+        &line_squared_sum,
+        &line_weight);
+    const double point_squared_sum = candidate.rms * candidate.rms * point_weight * 2.0;
+    return std::sqrt(
+        (point_squared_sum + line_squared_sum) /
+        std::max(1e-8, (point_weight + line_weight) * 2.0));
+}
+
+bool InitializeCandidateLines(
+    Candidate *candidate,
+    const CameraList &cameras,
+    const LineObservationList &observations,
+    const VisibilityList &visibility) {
+    candidate->lines.clear();
+    if (observations[0].empty()) {
+        return true;
+    }
+
+    Vec3 anchor = Vec3::Zero();
+    for (const Vec3 &point : candidate->points) {
+        anchor += point;
+    }
+    anchor /= static_cast<double>(candidate->points.size());
+
+    double cloud_extent = 0.0;
+    for (const Vec3 &point : candidate->points) {
+        cloud_extent = std::max(cloud_extent, (point - anchor).norm());
+    }
+    const double sample_extent = std::max(0.25, cloud_extent * 0.5);
+
+    candidate->lines.reserve(observations[0].size());
+    for (std::size_t line_index = 0; line_index < observations[0].size(); ++line_index) {
+        Mat3 normal_covariance = Mat3::Zero();
+        Vec3 plane_rhs = Vec3::Zero();
+        double total_weight = 0.0;
+
+        int observed_camera_count = 0;
+        for (std::size_t camera_index = 0; camera_index < candidate->poses.size(); ++camera_index) {
+            if (cameras[camera_index].pose_only ||
+                !visibility[camera_index][line_index]) {
+                continue;
+            }
+            observed_camera_count++;
+            const Vec3 equation = observations[camera_index][line_index].equation;
+            Vec3 camera_normal(
+                equation.x() * candidate->focals[camera_index],
+                equation.y() * candidate->focals[camera_index],
+                equation.x() * cameras[camera_index].principal.x() +
+                    equation.y() * cameras[camera_index].principal.y() +
+                    equation.z());
+            if (!camera_normal.allFinite() || camera_normal.norm() < 1e-10) {
+                return false;
+            }
+            camera_normal.normalize();
+            const Vec3 world_normal =
+                (candidate->poses[camera_index].R().transpose() * camera_normal).normalized();
+            const double weight =
+                cameras[camera_index].confidence *
+                observations[camera_index][line_index].confidence;
+            const double plane_offset =
+                world_normal.dot(candidate->poses[camera_index].center());
+            normal_covariance += weight * world_normal * world_normal.transpose();
+            plane_rhs += weight * world_normal * plane_offset;
+            total_weight += weight;
+        }
+
+        Eigen::SelfAdjointEigenSolver<Mat3> eigen_solver(normal_covariance);
+        if (observed_camera_count < 2 ||
+            eigen_solver.info() != Eigen::Success ||
+            eigen_solver.eigenvalues().y() < total_weight * 1e-7) {
+            return false;
+        }
+
+        Line3D line;
+        line.direction = eigen_solver.eigenvectors().col(0).normalized();
+        const double gauge_weight = std::max(1e-6, total_weight);
+        const Mat3 system =
+            normal_covariance + gauge_weight * line.direction * line.direction.transpose();
+        const Vec3 right_hand_side =
+            plane_rhs + gauge_weight * line.direction * line.direction.dot(anchor);
+        line.point = system.ldlt().solve(right_hand_side);
+        line.sample_extent = sample_extent;
+        if (!line.point.allFinite() || !line.direction.allFinite()) {
+            return false;
+        }
+        candidate->lines.push_back(line);
+    }
+    return true;
 }
 
 std::vector<double> FocalSeeds(const NormalizedCamera &camera) {
@@ -259,7 +486,7 @@ double EssentialMismatch(const Mat3 &fundamental, const Mat3 &matrix1, const Mat
 
 std::vector<std::pair<double, double>> EstimateFocalPairs(
     const PairGeometry &pair,
-    const std::array<NormalizedCamera, kCameraCount> &cameras) {
+    const CameraList &cameras) {
     const auto &first_camera = cameras[pair.first];
     const auto &second_camera = cameras[pair.second];
     std::vector<std::pair<double, double>> output;
@@ -369,6 +596,15 @@ bool InitializeThirdCamera(
     std::mt19937 generator(static_cast<std::uint32_t>(random_seed + camera_index * 7919));
     std::uniform_int_distribution<std::size_t> distribution(0, points.size() - 1);
     const std::size_t iterations = points.size() <= 10 ? 800 : 1200;
+    const int required_inliers = std::max(
+        4,
+        std::min(
+            6,
+            static_cast<int>(
+                std::ceil(static_cast<double>(points.size()) * 0.7))));
+    const int required_positive = points.size() < 6
+        ? static_cast<int>(points.size())
+        : static_cast<int>(points.size() * 0.8);
 
     *best_score = std::numeric_limits<double>::max();
     int best_inlier_count = 0;
@@ -414,12 +650,12 @@ bool InitializeThirdCamera(
                     poses[solution],
                     &is_positive);
                 positive += is_positive ? 1 : 0;
-                if (squared < 25.0) {
+                if (squared < 64.0) {
                     ++inliers;
                     squared_sum += squared;
                 }
             }
-            if (positive < static_cast<int>(points.size() * 0.8) || inliers < 6) {
+            if (positive < required_positive || inliers < required_inliers) {
                 continue;
             }
 
@@ -432,7 +668,7 @@ bool InitializeThirdCamera(
             }
         }
     }
-    return best_inlier_count >= 6 && std::isfinite(*best_score);
+    return best_inlier_count >= required_inliers && std::isfinite(*best_score);
 }
 
 void ReanchorToCameraZero(Candidate *candidate) {
@@ -442,8 +678,8 @@ void ReanchorToCameraZero(Candidate *candidate) {
         point = rotation0 * point + translation0;
     }
 
-    PoseArray reanchored{};
-    for (int camera_index = 0; camera_index < kCameraCount; ++camera_index) {
+    std::vector<poselib::CameraPose> reanchored(candidate->poses.size());
+    for (std::size_t camera_index = 0; camera_index < candidate->poses.size(); ++camera_index) {
         const Mat3 rotation = candidate->poses[camera_index].R() * rotation0.transpose();
         const Vec3 translation = candidate->poses[camera_index].t - rotation * translation0;
         reanchored[camera_index] = poselib::CameraPose(rotation, translation);
@@ -458,7 +694,7 @@ void ReanchorToCameraZero(Candidate *candidate) {
     for (Vec3 &point : candidate->points) {
         point *= inverse_baseline;
     }
-    for (int camera_index = 1; camera_index < kCameraCount; ++camera_index) {
+    for (std::size_t camera_index = 1; camera_index < candidate->poses.size(); ++camera_index) {
         const Mat3 rotation = candidate->poses[camera_index].R();
         const Vec3 center = candidate->poses[camera_index].center() * inverse_baseline;
         candidate->poses[camera_index].t = -rotation * center;
@@ -467,8 +703,10 @@ void ReanchorToCameraZero(Candidate *candidate) {
 
 std::vector<Candidate> CreateInitialCandidates(
     const std::vector<PairGeometry> &pairs,
-    const std::array<NormalizedCamera, kCameraCount> &cameras,
-    const std::array<std::vector<Vec2>, kCameraCount> &observations,
+    const CameraList &cameras,
+    const PointObservationList &observations,
+    const VisibilityList &visibility,
+    const PointConfidenceList &point_confidences,
     const int random_seed) {
     std::vector<Candidate> candidates;
 
@@ -502,6 +740,8 @@ std::vector<Candidate> CreateInitialCandidates(
                 relative_pose.t /= translation_norm;
 
                 Candidate candidate;
+                candidate.poses.resize(kBaseCameraCount);
+                candidate.focals.resize(kBaseCameraCount);
                 candidate.poses[pair.first] = poselib::CameraPose();
                 candidate.poses[pair.second] = relative_pose;
                 candidate.focals[pair.first] = first_focal;
@@ -547,8 +787,16 @@ std::vector<Candidate> CreateInitialCandidates(
                     continue;
                 }
                 int positive_count = 0;
-                candidate.score = ScoreCandidate(candidate, cameras, observations, &positive_count);
-                if (positive_count == static_cast<int>(candidate.points.size() * kCameraCount) &&
+                int visible_count = 0;
+                candidate.score = ScoreCandidate(
+                    candidate,
+                    cameras,
+                    observations,
+                    visibility,
+                    point_confidences,
+                    &positive_count,
+                    &visible_count);
+                if (positive_count == visible_count &&
                     std::isfinite(candidate.score)) {
                     candidates.push_back(std::move(candidate));
                 }
@@ -560,6 +808,164 @@ std::vector<Candidate> CreateInitialCandidates(
         return left.score < right.score;
     });
     return candidates;
+}
+
+// 使用固定三维点线细化单个附加相机。
+bool OptimizeFixedStructureCamera(
+    Candidate *candidate,
+    const CameraList &cameras,
+    const PointObservationList &observations,
+    const VisibilityList &point_visibility,
+    const PointConfidenceList &point_confidences,
+    const LineObservationList &line_observations,
+    const VisibilityList &line_visibility,
+    std::size_t camera_index);
+
+// 使用各附加机位实际可见的基础点初始化其位姿和焦距。
+bool InitializeAdditionalCameras(
+    Candidate *candidate,
+    const CameraList &cameras,
+    const PointObservationList &observations,
+    const VisibilityList &visibility,
+    const PointConfidenceList &point_confidences,
+    const LineObservationList &line_observations,
+    const VisibilityList &line_visibility,
+    const int random_seed,
+    int *failed_camera_index) {
+    for (std::size_t camera_index = kBaseCameraCount;
+         camera_index < cameras.size();
+         ++camera_index) {
+        std::vector<Vec2> visible_observations;
+        std::vector<Vec3> visible_points;
+        for (std::size_t point_index = 0; point_index < candidate->points.size(); ++point_index) {
+            if (visibility[camera_index][point_index]) {
+                visible_observations.push_back(observations[camera_index][point_index]);
+                visible_points.push_back(candidate->points[point_index]);
+            }
+        }
+
+        poselib::CameraPose pose;
+        double focal = 0.0;
+        double score = 0.0;
+        if (!InitializeThirdCamera(
+                static_cast<int>(camera_index),
+                cameras[camera_index],
+                visible_observations,
+                visible_points,
+                random_seed,
+                &pose,
+                &focal,
+                &score)) {
+            *failed_camera_index = static_cast<int>(camera_index);
+            return false;
+        }
+        candidate->poses.push_back(pose);
+        candidate->focals.push_back(focal);
+        if (!OptimizeFixedStructureCamera(
+                candidate,
+                cameras,
+                observations,
+                visibility,
+                point_confidences,
+                line_observations,
+                line_visibility,
+                camera_index)) {
+            *failed_camera_index = static_cast<int>(camera_index);
+            return false;
+        }
+    }
+    return true;
+}
+
+// 使用两个以上参与公共重建的附加机位共同初始化新点。
+bool InitializeAdditionalPoints(
+    Candidate *candidate,
+    const CameraList &cameras,
+    const PointObservationList &observations,
+    const VisibilityList &visibility,
+    const int base_point_count,
+    int *failed_point_index) {
+    const std::size_t point_count = observations[0].size();
+    for (std::size_t point_index = static_cast<std::size_t>(base_point_count);
+         point_index < point_count;
+         ++point_index) {
+        int best_first = -1;
+        int best_second = -1;
+        double best_angle = 0.0;
+
+        // 选择观察射线夹角最大的相机对进行初始三角化。
+        for (std::size_t first = kBaseCameraCount; first < cameras.size(); ++first) {
+            if (cameras[first].pose_only || !visibility[first][point_index]) {
+                continue;
+            }
+            const Vec3 first_ray =
+                candidate->poses[first].R().transpose() *
+                Bearing(
+                    cameras[first],
+                    candidate->focals[first],
+                    observations[first][point_index]);
+            for (std::size_t second = first + 1; second < cameras.size(); ++second) {
+                if (cameras[second].pose_only || !visibility[second][point_index]) {
+                    continue;
+                }
+                const Vec3 second_ray =
+                    candidate->poses[second].R().transpose() *
+                    Bearing(
+                        cameras[second],
+                        candidate->focals[second],
+                        observations[second][point_index]);
+                const double cosine =
+                    std::clamp(first_ray.dot(second_ray), -1.0, 1.0);
+                const double angle = RadiansToDegrees(std::acos(cosine));
+                if (angle > best_angle) {
+                    best_first = static_cast<int>(first);
+                    best_second = static_cast<int>(second);
+                    best_angle = angle;
+                }
+            }
+        }
+        if (best_first < 0 || best_second < 0 || best_angle < 0.25) {
+            *failed_point_index = static_cast<int>(point_index);
+            return false;
+        }
+
+        const poselib::CameraPose &first_pose = candidate->poses[best_first];
+        const poselib::CameraPose &second_pose = candidate->poses[best_second];
+        const Mat3 relative_rotation =
+            second_pose.R() * first_pose.R().transpose();
+        const Vec3 relative_translation =
+            second_pose.t - relative_rotation * first_pose.t;
+        const poselib::CameraPose second_from_first(
+            relative_rotation,
+            relative_translation);
+        const Vec3 point_in_first = Triangulate(
+            observations[best_first][point_index],
+            observations[best_second][point_index],
+            cameras[best_first],
+            cameras[best_second],
+            candidate->focals[best_first],
+            candidate->focals[best_second],
+            second_from_first);
+        const Vec3 point =
+            first_pose.R().transpose() * (point_in_first - first_pose.t);
+        if (!point.allFinite()) {
+            *failed_point_index = static_cast<int>(point_index);
+            return false;
+        }
+
+        for (std::size_t camera_index = kBaseCameraCount;
+             camera_index < cameras.size();
+             ++camera_index) {
+            if (!cameras[camera_index].pose_only &&
+                visibility[camera_index][point_index] &&
+                candidate->poses[camera_index].apply(point).z() <= 1e-8) {
+                *failed_point_index = static_cast<int>(point_index);
+                return false;
+            }
+        }
+        candidate->points.push_back(point);
+    }
+    return candidate->points.size() == point_count;
 }
 
 struct ReprojectionCost {
@@ -594,12 +1000,82 @@ struct ReprojectionCost {
     Vec2 principal_;
 };
 
+struct LineReprojectionCost {
+    LineReprojectionCost(
+        const Vec3 &equation,
+        const Vec2 &principal,
+        const double sample_extent)
+        : equation_(equation), principal_(principal), sample_extent_(sample_extent) {
+    }
+
+    template <typename T>
+    bool operator()(
+        const T *const rotation,
+        const T *const center,
+        const T *const log_focal,
+        const T *const line_point,
+        const T *const line_direction,
+        T *residuals) const {
+        const T focal = exp(log_focal[0]);
+        for (int endpoint = 0; endpoint < 2; ++endpoint) {
+            const T offset = T(endpoint == 0 ? -sample_extent_ : sample_extent_);
+            T relative[3]{
+                line_point[0] + offset * line_direction[0] - center[0],
+                line_point[1] + offset * line_direction[1] - center[1],
+                line_point[2] + offset * line_direction[2] - center[2],
+            };
+            T camera_point[3];
+            ceres::AngleAxisRotatePoint(rotation, relative, camera_point);
+            const T inverse_depth = T(1.0) / camera_point[2];
+            const T projected_x =
+                focal * camera_point[0] * inverse_depth + T(principal_.x());
+            const T projected_y =
+                focal * camera_point[1] * inverse_depth + T(principal_.y());
+            residuals[endpoint] =
+                T(equation_.x()) * projected_x +
+                T(equation_.y()) * projected_y +
+                T(equation_.z());
+        }
+        return true;
+    }
+
+    Vec3 equation_;
+    Vec2 principal_;
+    double sample_extent_;
+};
+
+struct LineGaugeCost {
+    LineGaugeCost(const Vec3 &anchor, const double inverse_extent)
+        : anchor_(anchor), inverse_extent_(inverse_extent) {
+    }
+
+    template <typename T>
+    bool operator()(
+        const T *const line_point,
+        const T *const line_direction,
+        T *residuals) const {
+        residuals[0] =
+            T(inverse_extent_) *
+            ((line_point[0] - T(anchor_.x())) * line_direction[0] +
+             (line_point[1] - T(anchor_.y())) * line_direction[1] +
+             (line_point[2] - T(anchor_.z())) * line_direction[2]);
+        return true;
+    }
+
+    Vec3 anchor_;
+    double inverse_extent_;
+};
+
 bool OptimizeCandidate(
     Candidate *candidate,
-    const std::array<NormalizedCamera, kCameraCount> &cameras,
-    const std::array<std::vector<Vec2>, kCameraCount> &observations) {
-    std::array<CameraParameters, kCameraCount> parameters{};
-    for (int camera_index = 0; camera_index < kCameraCount; ++camera_index) {
+    const CameraList &cameras,
+    const PointObservationList &observations,
+    const VisibilityList &point_visibility,
+    const PointConfidenceList &point_confidences,
+    const LineObservationList &line_observations,
+    const VisibilityList &line_visibility) {
+    std::vector<CameraParameters> parameters(candidate->poses.size());
+    for (std::size_t camera_index = 0; camera_index < candidate->poses.size(); ++camera_index) {
         const Mat3 rotation = candidate->poses[camera_index].R();
         ceres::RotationMatrixToAngleAxis(rotation.data(), parameters[camera_index].rotation);
         const Vec3 center = candidate->poses[camera_index].center();
@@ -612,8 +1088,21 @@ bool OptimizeCandidate(
         std::copy(candidate->points[index].data(), candidate->points[index].data() + 3, points[index].data());
     }
 
+    std::vector<std::array<double, 3>> line_points(candidate->lines.size());
+    std::vector<std::array<double, 3>> line_directions(candidate->lines.size());
+    for (std::size_t index = 0; index < candidate->lines.size(); ++index) {
+        std::copy(
+            candidate->lines[index].point.data(),
+            candidate->lines[index].point.data() + 3,
+            line_points[index].data());
+        std::copy(
+            candidate->lines[index].direction.data(),
+            candidate->lines[index].direction.data() + 3,
+            line_directions[index].data());
+    }
+
     ceres::Problem problem;
-    for (int camera_index = 0; camera_index < kCameraCount; ++camera_index) {
+    for (std::size_t camera_index = 0; camera_index < candidate->poses.size(); ++camera_index) {
         problem.AddParameterBlock(parameters[camera_index].rotation, 3);
         problem.AddParameterBlock(parameters[camera_index].center, 3);
         problem.AddParameterBlock(&parameters[camera_index].log_focal, 1);
@@ -621,6 +1110,11 @@ bool OptimizeCandidate(
             &parameters[camera_index].log_focal, 0, std::log(cameras[camera_index].min_focal));
         problem.SetParameterUpperBound(
             &parameters[camera_index].log_focal, 0, std::log(cameras[camera_index].max_focal));
+        if (cameras[camera_index].pose_only) {
+            problem.SetParameterBlockConstant(parameters[camera_index].rotation);
+            problem.SetParameterBlockConstant(parameters[camera_index].center);
+            problem.SetParameterBlockConstant(&parameters[camera_index].log_focal);
+        }
     }
 
     problem.SetParameterBlockConstant(parameters[0].rotation);
@@ -628,18 +1122,73 @@ bool OptimizeCandidate(
     problem.SetManifold(parameters[1].center, new ceres::SphereManifold<3>());
 
     for (std::size_t point_index = 0; point_index < points.size(); ++point_index) {
-        for (int camera_index = 0; camera_index < kCameraCount; ++camera_index) {
+        for (std::size_t camera_index = 0; camera_index < candidate->poses.size(); ++camera_index) {
+            if (cameras[camera_index].pose_only ||
+                !point_visibility[camera_index][point_index]) {
+                continue;
+            }
             auto *cost = new ceres::AutoDiffCostFunction<ReprojectionCost, 2, 3, 3, 1, 3>(
                 new ReprojectionCost(
                     observations[camera_index][point_index], cameras[camera_index].principal));
             problem.AddResidualBlock(
                 cost,
-                new ceres::HuberLoss(3.0),
+                new ceres::ScaledLoss(
+                    new ceres::HuberLoss(3.0),
+                    cameras[camera_index].confidence *
+                        point_confidences[camera_index][point_index],
+                    ceres::TAKE_OWNERSHIP),
                 parameters[camera_index].rotation,
                 parameters[camera_index].center,
                 &parameters[camera_index].log_focal,
                 points[point_index].data());
         }
+    }
+
+    Vec3 line_anchor = Vec3::Zero();
+    for (const Vec3 &point : candidate->points) {
+        line_anchor += point;
+    }
+    line_anchor /= static_cast<double>(candidate->points.size());
+    for (std::size_t line_index = 0; line_index < candidate->lines.size(); ++line_index) {
+        problem.AddParameterBlock(line_points[line_index].data(), 3);
+        problem.AddParameterBlock(line_directions[line_index].data(), 3);
+        problem.SetManifold(line_directions[line_index].data(), new ceres::SphereManifold<3>());
+
+        for (std::size_t camera_index = 0; camera_index < candidate->poses.size(); ++camera_index) {
+            if (cameras[camera_index].pose_only ||
+                !line_visibility[camera_index][line_index]) {
+                continue;
+            }
+            const NormalizedLineObservation &observation =
+                line_observations[camera_index][line_index];
+            auto *cost =
+                new ceres::AutoDiffCostFunction<LineReprojectionCost, 2, 3, 3, 1, 3, 3>(
+                    new LineReprojectionCost(
+                        observation.equation,
+                        cameras[camera_index].principal,
+                        candidate->lines[line_index].sample_extent));
+            problem.AddResidualBlock(
+                cost,
+                new ceres::ScaledLoss(
+                    new ceres::HuberLoss(3.0),
+                    cameras[camera_index].confidence * observation.confidence,
+                    ceres::TAKE_OWNERSHIP),
+                parameters[camera_index].rotation,
+                parameters[camera_index].center,
+                &parameters[camera_index].log_focal,
+                line_points[line_index].data(),
+                line_directions[line_index].data());
+        }
+
+        auto *gauge_cost = new ceres::AutoDiffCostFunction<LineGaugeCost, 1, 3, 3>(
+            new LineGaugeCost(
+                line_anchor,
+                1.0 / std::max(1e-6, candidate->lines[line_index].sample_extent)));
+        problem.AddResidualBlock(
+            gauge_cost,
+            nullptr,
+            line_points[line_index].data(),
+            line_directions[line_index].data());
     }
 
     ceres::Solver::Options options;
@@ -658,7 +1207,7 @@ bool OptimizeCandidate(
         return false;
     }
 
-    for (int camera_index = 0; camera_index < kCameraCount; ++camera_index) {
+    for (std::size_t camera_index = 0; camera_index < candidate->poses.size(); ++camera_index) {
         Mat3 rotation;
         ceres::AngleAxisToRotationMatrix(parameters[camera_index].rotation, rotation.data());
         const Vec3 center(parameters[camera_index].center);
@@ -668,24 +1217,221 @@ bool OptimizeCandidate(
     for (std::size_t index = 0; index < points.size(); ++index) {
         candidate->points[index] = Vec3(points[index].data());
     }
+    for (std::size_t index = 0; index < candidate->lines.size(); ++index) {
+        candidate->lines[index].direction = Vec3(line_directions[index].data()).normalized();
+        candidate->lines[index].point = Vec3(line_points[index].data());
+        candidate->lines[index].point -=
+            candidate->lines[index].direction *
+            candidate->lines[index].direction.dot(candidate->lines[index].point - line_anchor);
+    }
 
     int positive_count = 0;
-    candidate->rms = ScoreCandidate(*candidate, cameras, observations, &positive_count);
-    candidate->score = candidate->rms;
-    candidate->median_angle = ComputeMedianTriangulationAngle(candidate->poses, candidate->points);
+    int visible_count = 0;
+    candidate->rms = ScoreCandidate(
+        *candidate,
+        cameras,
+        observations,
+        point_visibility,
+        point_confidences,
+        &positive_count,
+        &visible_count);
+    candidate->line_rms = ScoreLines(
+        *candidate,
+        cameras,
+        line_observations,
+        line_visibility);
+    candidate->score = CombinedCandidateScore(
+        *candidate,
+        cameras,
+        point_visibility,
+        point_confidences,
+        line_observations,
+        line_visibility);
+    candidate->median_angle = ComputeMedianTriangulationAngle(
+        candidate->poses,
+        candidate->points,
+        point_visibility,
+        cameras);
     candidate->optimized = true;
-    return positive_count == static_cast<int>(candidate->points.size() * kCameraCount) &&
-           std::isfinite(candidate->rms);
+    return positive_count == visible_count &&
+           std::isfinite(candidate->rms) &&
+           std::isfinite(candidate->line_rms) &&
+           std::isfinite(candidate->score);
+}
+
+// 使用固定三维点线细化单个附加相机。
+bool OptimizeFixedStructureCamera(
+    Candidate *candidate,
+    const CameraList &cameras,
+    const PointObservationList &observations,
+    const VisibilityList &point_visibility,
+    const PointConfidenceList &point_confidences,
+    const LineObservationList &line_observations,
+    const VisibilityList &line_visibility,
+    const std::size_t camera_index) {
+    CameraParameters parameters;
+    const Mat3 rotation = candidate->poses[camera_index].R();
+    ceres::RotationMatrixToAngleAxis(rotation.data(), parameters.rotation);
+    const Vec3 center = candidate->poses[camera_index].center();
+    std::copy(center.data(), center.data() + 3, parameters.center);
+    parameters.log_focal = std::log(candidate->focals[camera_index]);
+
+    ceres::Problem problem;
+    problem.AddParameterBlock(parameters.rotation, 3);
+    problem.AddParameterBlock(parameters.center, 3);
+    problem.AddParameterBlock(&parameters.log_focal, 1);
+    problem.SetParameterLowerBound(
+        &parameters.log_focal, 0, std::log(cameras[camera_index].min_focal));
+    problem.SetParameterUpperBound(
+        &parameters.log_focal, 0, std::log(cameras[camera_index].max_focal));
+
+    // 点和线参数全部固定，只有当前相机参数允许变化。
+    for (std::size_t point_index = 0;
+         point_index < candidate->points.size();
+         ++point_index) {
+        if (!point_visibility[camera_index][point_index]) {
+            continue;
+        }
+        double *point = candidate->points[point_index].data();
+        problem.AddParameterBlock(point, 3);
+        problem.SetParameterBlockConstant(point);
+        auto *cost =
+            new ceres::AutoDiffCostFunction<ReprojectionCost, 2, 3, 3, 1, 3>(
+                new ReprojectionCost(
+                    observations[camera_index][point_index],
+                    cameras[camera_index].principal));
+        problem.AddResidualBlock(
+            cost,
+            new ceres::ScaledLoss(
+                new ceres::HuberLoss(3.0),
+                cameras[camera_index].confidence *
+                    point_confidences[camera_index][point_index],
+                ceres::TAKE_OWNERSHIP),
+            parameters.rotation,
+            parameters.center,
+            &parameters.log_focal,
+            point);
+    }
+
+    for (std::size_t line_index = 0;
+         line_index < candidate->lines.size();
+         ++line_index) {
+        if (!line_visibility[camera_index][line_index]) {
+            continue;
+        }
+        Line3D &line = candidate->lines[line_index];
+        problem.AddParameterBlock(line.point.data(), 3);
+        problem.AddParameterBlock(line.direction.data(), 3);
+        problem.SetParameterBlockConstant(line.point.data());
+        problem.SetParameterBlockConstant(line.direction.data());
+        const NormalizedLineObservation &observation =
+            line_observations[camera_index][line_index];
+        auto *cost =
+            new ceres::AutoDiffCostFunction<
+                LineReprojectionCost,
+                2,
+                3,
+                3,
+                1,
+                3,
+                3>(
+                new LineReprojectionCost(
+                    observation.equation,
+                    cameras[camera_index].principal,
+                    line.sample_extent));
+        problem.AddResidualBlock(
+            cost,
+            new ceres::ScaledLoss(
+                new ceres::HuberLoss(3.0),
+                cameras[camera_index].confidence * observation.confidence,
+                ceres::TAKE_OWNERSHIP),
+            parameters.rotation,
+            parameters.center,
+            &parameters.log_focal,
+            line.point.data(),
+            line.direction.data());
+    }
+
+    ceres::Solver::Options options;
+    options.linear_solver_type = ceres::DENSE_QR;
+    options.max_num_iterations = 75;
+    options.num_threads = 1;
+    options.function_tolerance = 1e-12;
+    options.gradient_tolerance = 1e-12;
+    options.parameter_tolerance = 1e-10;
+    options.minimizer_progress_to_stdout = false;
+    options.logging_type = ceres::SILENT;
+
+    ceres::Solver::Summary summary;
+    ceres::Solve(options, &problem, &summary);
+    if (!summary.IsSolutionUsable()) {
+        return false;
+    }
+
+    Mat3 optimized_rotation;
+    ceres::AngleAxisToRotationMatrix(
+        parameters.rotation,
+        optimized_rotation.data());
+    const Vec3 optimized_center(parameters.center);
+    candidate->poses[camera_index] =
+        poselib::CameraPose(
+            optimized_rotation,
+            -optimized_rotation * optimized_center);
+    candidate->focals[camera_index] = std::exp(parameters.log_focal);
+
+    for (std::size_t point_index = 0;
+         point_index < candidate->points.size();
+         ++point_index) {
+        if (point_visibility[camera_index][point_index] &&
+            candidate->poses[camera_index]
+                    .apply(candidate->points[point_index])
+                    .z() <= 1e-8) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// 固定公共三维结构，分别优化仅定位机位的位置、旋转和焦距。
+bool OptimizePoseOnlyCameras(
+    Candidate *candidate,
+    const CameraList &cameras,
+    const PointObservationList &observations,
+    const VisibilityList &point_visibility,
+    const PointConfidenceList &point_confidences,
+    const LineObservationList &line_observations,
+    const VisibilityList &line_visibility,
+    int *failed_camera_index) {
+    for (std::size_t camera_index = kBaseCameraCount;
+         camera_index < candidate->poses.size();
+         ++camera_index) {
+        if (!cameras[camera_index].pose_only) {
+            continue;
+        }
+        if (!OptimizeFixedStructureCamera(
+                candidate,
+                cameras,
+                observations,
+                point_visibility,
+                point_confidences,
+                line_observations,
+                line_visibility,
+                camera_index)) {
+            *failed_camera_index = static_cast<int>(camera_index);
+            return false;
+        }
+    }
+    return true;
 }
 
 std::vector<PairGeometry> EstimatePairGeometry(
-    const std::array<std::vector<Vec2>, kCameraCount> &observations,
+    const PointObservationList &observations,
     const int random_seed,
     bool *planar_degenerate) {
     std::vector<PairGeometry> pairs;
     int planar_pair_count = 0;
-    for (int first = 0; first < kCameraCount; ++first) {
-        for (int second = first + 1; second < kCameraCount; ++second) {
+    for (int first = 0; first < kBaseCameraCount; ++first) {
+        for (int second = first + 1; second < kBaseCameraCount; ++second) {
             poselib::RansacOptions ransac;
             ransac.seed = static_cast<unsigned long>(random_seed + first * 31 + second * 101);
             ransac.min_iterations = 100;
@@ -733,22 +1479,34 @@ std::vector<PairGeometry> EstimatePairGeometry(
 
 std::string HighErrorPointMessage(
     const Candidate &candidate,
-    const std::array<NormalizedCamera, kCameraCount> &cameras,
-    const std::array<std::vector<Vec2>, kCameraCount> &observations,
+    const CameraList &cameras,
+    const PointObservationList &observations,
+    const VisibilityList &visibility,
+    const PointConfidenceList &point_confidences,
     const std::int32_t *point_ids,
     const double threshold) {
     std::vector<int> failed_ids;
     for (std::size_t point_index = 0; point_index < candidate.points.size(); ++point_index) {
         double squared_sum = 0.0;
-        for (int camera_index = 0; camera_index < kCameraCount; ++camera_index) {
-            squared_sum += ReprojectionSquared(
-                candidate.points[point_index],
-                observations[camera_index][point_index],
-                cameras[camera_index],
-                candidate.focals[camera_index],
-                candidate.poses[camera_index]);
+        double weight_sum = 0.0;
+        for (std::size_t camera_index = 0; camera_index < candidate.poses.size(); ++camera_index) {
+            if (cameras[camera_index].pose_only ||
+                !visibility[camera_index][point_index]) {
+                continue;
+            }
+            const double confidence =
+                cameras[camera_index].confidence *
+                point_confidences[camera_index][point_index];
+            squared_sum += confidence *
+                           ReprojectionSquared(
+                               candidate.points[point_index],
+                               observations[camera_index][point_index],
+                               cameras[camera_index],
+                               candidate.focals[camera_index],
+                               candidate.poses[camera_index]);
+            weight_sum += confidence;
         }
-        const double rms = std::sqrt(squared_sum / (kCameraCount * 2.0));
+        const double rms = std::sqrt(squared_sum / std::max(1e-8, weight_sum * 2.0));
         if (!std::isfinite(rms) || rms > threshold) {
             failed_ids.push_back(point_ids[point_index]);
         }
@@ -766,6 +1524,234 @@ std::string HighErrorPointMessage(
         stream << failed_ids[index];
     }
     return stream.str();
+}
+
+std::string HighErrorLineMessage(
+    const Candidate &candidate,
+    const CameraList &cameras,
+    const LineObservationList &observations,
+    const VisibilityList &visibility,
+    const std::int32_t *line_ids,
+    const double threshold) {
+    std::ostringstream stream;
+    bool has_failure = false;
+    for (std::size_t line_index = 0; line_index < candidate.lines.size(); ++line_index) {
+        double squared_sum = 0.0;
+        double weight_sum = 0.0;
+        for (std::size_t camera_index = 0; camera_index < candidate.poses.size(); ++camera_index) {
+            if (cameras[camera_index].pose_only ||
+                !visibility[camera_index][line_index]) {
+                continue;
+            }
+            const NormalizedLineObservation &observation =
+                observations[camera_index][line_index];
+            const double confidence =
+                cameras[camera_index].confidence * observation.confidence;
+            const auto residuals = LineResiduals(
+                candidate.lines[line_index],
+                observation,
+                cameras[camera_index],
+                candidate.focals[camera_index],
+                candidate.poses[camera_index]);
+            squared_sum += confidence *
+                           (residuals[0] * residuals[0] + residuals[1] * residuals[1]);
+            weight_sum += confidence;
+        }
+        const double rms = std::sqrt(squared_sum / std::max(1e-8, weight_sum * 2.0));
+        if (std::isfinite(rms) && rms <= threshold) {
+            continue;
+        }
+
+        if (!has_failure) {
+            stream << "These line IDs have excessive reprojection error:\n";
+            has_failure = true;
+        }
+
+        bool has_camera_detail = false;
+        for (std::size_t camera_index = 0;
+             camera_index < candidate.poses.size();
+             ++camera_index) {
+            if (cameras[camera_index].pose_only ||
+                !visibility[camera_index][line_index]) {
+                continue;
+            }
+            const NormalizedLineObservation &observation =
+                observations[camera_index][line_index];
+            const auto residuals = LineResiduals(
+                candidate.lines[line_index],
+                observation,
+                cameras[camera_index],
+                candidate.focals[camera_index],
+                candidate.poses[camera_index]);
+            const double camera_rms = std::sqrt(
+                (residuals[0] * residuals[0] + residuals[1] * residuals[1]) * 0.5);
+            if (std::isfinite(camera_rms) && camera_rms <= threshold) {
+                continue;
+            }
+
+            const double pixel_scale = cameras[camera_index].pixel_scale;
+            stream << "Camera " << camera_index
+                   << " / Line " << line_ids[line_index]
+                   << ": RMS=" << std::fixed << std::setprecision(2) << camera_rms
+                   << " normalized px (" << camera_rms / pixel_scale
+                   << " source-image px), allowed=" << threshold
+                   << " normalized px (" << threshold / pixel_scale
+                   << " source-image px), confidence="
+                   << cameras[camera_index].confidence * observation.confidence
+                   << ".\n";
+            has_camera_detail = true;
+        }
+        if (!has_camera_detail) {
+            stream << "Line " << line_ids[line_index]
+                   << ": combined RMS=" << std::fixed << std::setprecision(2) << rms
+                   << " normalized px, allowed=" << threshold
+                   << " normalized px.\n";
+        }
+    }
+
+    if (!has_failure) {
+        return {};
+    }
+    stream << "Parallel lines are supported. Adjust the listed Canvas RefLine2D; "
+              "the projected 3D line is too far from that marked 2D line.";
+    return stream.str();
+}
+
+// 汇总仅定位机位自身的点线重投影误差。
+std::string HighErrorPoseOnlyCameraMessage(
+    const Candidate &candidate,
+    const CameraList &cameras,
+    const PointObservationList &point_observations,
+    const VisibilityList &point_visibility,
+    const PointConfidenceList &point_confidences,
+    const LineObservationList &line_observations,
+    const VisibilityList &line_visibility,
+    const std::int32_t *point_ids,
+    const std::int32_t *line_ids,
+    const double threshold) {
+    std::ostringstream stream;
+    bool has_failure = false;
+    for (std::size_t camera_index = kBaseCameraCount;
+         camera_index < candidate.poses.size();
+         ++camera_index) {
+        if (!cameras[camera_index].pose_only) {
+            continue;
+        }
+
+        double squared_sum = 0.0;
+        double weight_sum = 0.0;
+        for (std::size_t point_index = 0;
+             point_index < candidate.points.size();
+             ++point_index) {
+            if (!point_visibility[camera_index][point_index]) {
+                continue;
+            }
+            const double confidence =
+                cameras[camera_index].confidence *
+                point_confidences[camera_index][point_index];
+            squared_sum += confidence *
+                           ReprojectionSquared(
+                               candidate.points[point_index],
+                               point_observations[camera_index][point_index],
+                               cameras[camera_index],
+                               candidate.focals[camera_index],
+                               candidate.poses[camera_index]);
+            weight_sum += confidence;
+        }
+        for (std::size_t line_index = 0;
+             line_index < candidate.lines.size();
+             ++line_index) {
+            if (!line_visibility[camera_index][line_index]) {
+                continue;
+            }
+            const NormalizedLineObservation &observation =
+                line_observations[camera_index][line_index];
+            const double confidence =
+                cameras[camera_index].confidence * observation.confidence;
+            const auto residuals = LineResiduals(
+                candidate.lines[line_index],
+                observation,
+                cameras[camera_index],
+                candidate.focals[camera_index],
+                candidate.poses[camera_index]);
+            squared_sum += confidence *
+                           (residuals[0] * residuals[0] +
+                            residuals[1] * residuals[1]);
+            weight_sum += confidence;
+        }
+
+        const double rms =
+            std::sqrt(squared_sum / std::max(1e-8, weight_sum * 2.0));
+        if (std::isfinite(rms) && rms <= threshold) {
+            continue;
+        }
+
+        if (!has_failure) {
+            stream << "These pose-only cameras have excessive reprojection error:\n";
+            has_failure = true;
+        }
+
+        stream << "Camera " << camera_index
+               << ": combined RMS=" << std::fixed << std::setprecision(2) << rms
+               << " normalized px, allowed=" << threshold << " normalized px.\n";
+        for (std::size_t point_index = 0;
+             point_index < candidate.points.size();
+             ++point_index) {
+            if (!point_visibility[camera_index][point_index]) {
+                continue;
+            }
+            const double point_rms = std::sqrt(
+                ReprojectionSquared(
+                    candidate.points[point_index],
+                    point_observations[camera_index][point_index],
+                    cameras[camera_index],
+                    candidate.focals[camera_index],
+                    candidate.poses[camera_index]) *
+                0.5);
+            if (std::isfinite(point_rms) && point_rms <= threshold) {
+                continue;
+            }
+            const double pixel_scale = cameras[camera_index].pixel_scale;
+            stream << "Camera " << camera_index
+                   << " / Point " << point_ids[point_index]
+                   << ": RMS=" << point_rms
+                   << " normalized px (" << point_rms / pixel_scale
+                   << " source-image px), allowed=" << threshold
+                   << " normalized px (" << threshold / pixel_scale
+                   << " source-image px).\n";
+        }
+        for (std::size_t line_index = 0;
+             line_index < candidate.lines.size();
+             ++line_index) {
+            if (!line_visibility[camera_index][line_index]) {
+                continue;
+            }
+            const NormalizedLineObservation &observation =
+                line_observations[camera_index][line_index];
+            const auto residuals = LineResiduals(
+                candidate.lines[line_index],
+                observation,
+                cameras[camera_index],
+                candidate.focals[camera_index],
+                candidate.poses[camera_index]);
+            const double line_rms = std::sqrt(
+                (residuals[0] * residuals[0] + residuals[1] * residuals[1]) * 0.5);
+            if (std::isfinite(line_rms) && line_rms <= threshold) {
+                continue;
+            }
+            const double pixel_scale = cameras[camera_index].pixel_scale;
+            stream << "Camera " << camera_index
+                   << " / Line " << line_ids[line_index]
+                   << ": RMS=" << line_rms
+                   << " normalized px (" << line_rms / pixel_scale
+                   << " source-image px), allowed=" << threshold
+                   << " normalized px (" << threshold / pixel_scale
+                   << " source-image px), confidence="
+                   << cameras[camera_index].confidence * observation.confidence
+                   << ".\n";
+        }
+    }
+    return has_failure ? stream.str() : std::string{};
 }
 
 void ApplyKnownScale(
@@ -795,7 +1781,11 @@ void ApplyKnownScale(
     for (Vec3 &point : candidate->points) {
         point *= *applied_scale;
     }
-    for (int camera_index = 1; camera_index < kCameraCount; ++camera_index) {
+    for (Line3D &line : candidate->lines) {
+        line.point *= *applied_scale;
+        line.sample_extent *= *applied_scale;
+    }
+    for (std::size_t camera_index = 1; camera_index < candidate->poses.size(); ++camera_index) {
         const Mat3 rotation = candidate->poses[camera_index].R();
         const Vec3 center = candidate->poses[camera_index].center() * *applied_scale;
         candidate->poses[camera_index].t = -rotation * center;
@@ -804,14 +1794,20 @@ void ApplyKnownScale(
 
 void FillOutputs(
     const Candidate &candidate,
-    const std::array<NormalizedCamera, kCameraCount> &cameras,
-    const std::array<std::vector<Vec2>, kCameraCount> &observations,
+    const CameraList &cameras,
+    const PointObservationList &observations,
+    const VisibilityList &point_visibility,
+    const PointConfidenceList &point_confidences,
+    const LineObservationList &line_observations,
+    const VisibilityList &line_visibility,
     const std::int32_t *point_ids,
+    const std::int32_t *line_ids,
     RT_CameraOutput *camera_outputs,
-    RT_PointOutput *point_outputs) {
+    RT_PointOutput *point_outputs,
+    RT_LineOutput *line_outputs) {
     const Mat3 coordinate_flip = (Mat3() << 1.0, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 1.0).finished();
 
-    for (int camera_index = 0; camera_index < kCameraCount; ++camera_index) {
+    for (std::size_t camera_index = 0; camera_index < candidate.poses.size(); ++camera_index) {
         const double focal_pixels = candidate.focals[camera_index] / cameras[camera_index].pixel_scale;
         camera_outputs[camera_index].focal_length_pixels = focal_pixels;
         camera_outputs[camera_index].horizontal_fov_degrees =
@@ -832,16 +1828,25 @@ void FillOutputs(
         camera_outputs[camera_index].rotation_xyzw[3] = rotation.w();
 
         double squared_sum = 0.0;
+        double weight_sum = 0.0;
         for (std::size_t point_index = 0; point_index < candidate.points.size(); ++point_index) {
-            squared_sum += ReprojectionSquared(
-                candidate.points[point_index],
-                observations[camera_index][point_index],
-                cameras[camera_index],
-                candidate.focals[camera_index],
-                candidate.poses[camera_index]);
+            if (!point_visibility[camera_index][point_index]) {
+                continue;
+            }
+            const double confidence =
+                cameras[camera_index].confidence *
+                point_confidences[camera_index][point_index];
+            squared_sum += confidence *
+                           ReprojectionSquared(
+                               candidate.points[point_index],
+                               observations[camera_index][point_index],
+                               cameras[camera_index],
+                               candidate.focals[camera_index],
+                               candidate.poses[camera_index]);
+            weight_sum += confidence;
         }
         camera_outputs[camera_index].reprojection_rms_pixels =
-            std::sqrt(squared_sum / std::max<std::size_t>(1, candidate.points.size() * 2)) /
+            std::sqrt(squared_sum / std::max(1e-8, weight_sum * 2.0)) /
             cameras[camera_index].pixel_scale;
     }
 
@@ -851,35 +1856,92 @@ void FillOutputs(
         std::copy(point_unity.data(), point_unity.data() + 3, point_outputs[point_index].position);
 
         double squared_sum_pixels = 0.0;
-        for (int camera_index = 0; camera_index < kCameraCount; ++camera_index) {
+        double weight_sum = 0.0;
+        for (std::size_t camera_index = 0; camera_index < candidate.poses.size(); ++camera_index) {
+            if (cameras[camera_index].pose_only ||
+                !point_visibility[camera_index][point_index]) {
+                continue;
+            }
             const double squared_normalized = ReprojectionSquared(
                 candidate.points[point_index],
                 observations[camera_index][point_index],
                 cameras[camera_index],
                 candidate.focals[camera_index],
                 candidate.poses[camera_index]);
-            squared_sum_pixels += squared_normalized /
+            const double confidence =
+                cameras[camera_index].confidence *
+                point_confidences[camera_index][point_index];
+            squared_sum_pixels += confidence * squared_normalized /
                                   (cameras[camera_index].pixel_scale * cameras[camera_index].pixel_scale);
+            weight_sum += confidence;
         }
         point_outputs[point_index].reprojection_rms_pixels =
-            std::sqrt(squared_sum_pixels / (kCameraCount * 2.0));
+            std::sqrt(squared_sum_pixels / std::max(1e-8, weight_sum * 2.0));
+    }
+
+    for (std::size_t line_index = 0; line_index < candidate.lines.size(); ++line_index) {
+        line_outputs[line_index].id = line_ids[line_index];
+        const Vec3 point_unity = coordinate_flip * candidate.lines[line_index].point;
+        const Vec3 direction_unity =
+            (coordinate_flip * candidate.lines[line_index].direction).normalized();
+        std::copy(point_unity.data(), point_unity.data() + 3, line_outputs[line_index].point);
+        std::copy(
+            direction_unity.data(),
+            direction_unity.data() + 3,
+            line_outputs[line_index].direction);
+
+        double squared_sum_pixels = 0.0;
+        double weight_sum = 0.0;
+        for (std::size_t camera_index = 0; camera_index < candidate.poses.size(); ++camera_index) {
+            if (cameras[camera_index].pose_only ||
+                !line_visibility[camera_index][line_index]) {
+                continue;
+            }
+            const NormalizedLineObservation &observation =
+                line_observations[camera_index][line_index];
+            const double confidence =
+                cameras[camera_index].confidence * observation.confidence;
+            const auto residuals = LineResiduals(
+                candidate.lines[line_index],
+                observation,
+                cameras[camera_index],
+                candidate.focals[camera_index],
+                candidate.poses[camera_index]);
+            const double inverse_pixel_scale = 1.0 / cameras[camera_index].pixel_scale;
+            squared_sum_pixels +=
+                confidence *
+                (residuals[0] * residuals[0] + residuals[1] * residuals[1]) *
+                inverse_pixel_scale * inverse_pixel_scale;
+            weight_sum += confidence;
+        }
+        line_outputs[line_index].reprojection_rms_pixels =
+            std::sqrt(squared_sum_pixels / std::max(1e-8, weight_sum * 2.0));
     }
 }
 
 } // namespace
 
 const char *RT_CALL RT_GetVersion() {
-    return "ReconstructionNative/1.0.0 (PoseLib 2.0.5, Ceres 2.2.0)";
+    return "ReconstructionNative/1.8.0 (PoseLib 2.0.5, Ceres 2.2.0)";
 }
 
-std::int32_t RT_CALL RT_SolveThreeView(
+std::int32_t RT_CALL RT_SolveMultiView(
     const RT_CameraInput *cameras,
+    const std::int32_t camera_count,
     const std::int32_t *point_ids,
     const RT_Observation *observations,
+    const std::uint8_t *observation_visibility,
+    const double *observation_confidences,
     const std::int32_t point_count,
+    const std::int32_t base_point_count,
+    const std::int32_t *line_ids,
+    const RT_LineObservation *line_observations,
+    const std::uint8_t *line_observation_visibility,
+    const std::int32_t line_count,
     const RT_SolveOptions *options,
     RT_CameraOutput *camera_outputs,
     RT_PointOutput *point_outputs,
+    RT_LineOutput *line_outputs,
     RT_SolveReport *report,
     char *error_buffer,
     const std::int32_t error_buffer_capacity) {
@@ -890,12 +1952,24 @@ std::int32_t RT_CALL RT_SolveThreeView(
     WriteError(error_buffer, error_buffer_capacity, "");
 
     try {
-        if (cameras == nullptr || point_ids == nullptr || observations == nullptr || options == nullptr ||
+        if (cameras == nullptr || point_ids == nullptr || observations == nullptr ||
+            observation_visibility == nullptr || observation_confidences == nullptr ||
+            options == nullptr ||
             camera_outputs == nullptr || point_outputs == nullptr || report == nullptr) {
             throw std::invalid_argument("One or more required pointers are null.");
         }
-        if (point_count < 8) {
-            throw std::invalid_argument("At least 8 shared reference points are required.");
+        if (camera_count < kBaseCameraCount || camera_count > kMaximumCameraCount) {
+            throw std::invalid_argument("Camera count must be between 3 and 64.");
+        }
+        if (line_count < 0 ||
+            (line_count > 0 &&
+             (line_ids == nullptr || line_observations == nullptr ||
+              line_observation_visibility == nullptr || line_outputs == nullptr))) {
+            throw std::invalid_argument("Line count or line buffers are invalid.");
+        }
+        if (base_point_count < 8 || point_count < base_point_count) {
+            throw std::invalid_argument(
+                "At least 8 base reference points are required, and point count must include them.");
         }
         if (options->known_scale_distance <= 0.0) {
             throw std::invalid_argument("Known scale distance must be greater than zero.");
@@ -907,16 +1981,46 @@ std::int32_t RT_CALL RT_SolveThreeView(
                 throw std::invalid_argument("Point IDs must be unique.");
             }
         }
+        unique_ids.clear();
+        for (int line_index = 0; line_index < line_count; ++line_index) {
+            if (!unique_ids.insert(line_ids[line_index]).second) {
+                throw std::invalid_argument("Line IDs must be unique.");
+            }
+        }
 
-        std::array<NormalizedCamera, kCameraCount> normalized_cameras{};
-        std::array<std::vector<Vec2>, kCameraCount> normalized_observations;
-        for (int camera_index = 0; camera_index < kCameraCount; ++camera_index) {
+        CameraList normalized_cameras(camera_count);
+        PointObservationList normalized_observations(
+            camera_count,
+            std::vector<Vec2>(point_count, Vec2::Zero()));
+        VisibilityList normalized_visibility(
+            camera_count,
+            std::vector<char>(point_count, 0));
+        PointConfidenceList normalized_point_confidences(
+            camera_count,
+            std::vector<double>(point_count, 0.0));
+        LineObservationList normalized_line_observations(
+            camera_count,
+            std::vector<NormalizedLineObservation>(line_count));
+        VisibilityList normalized_line_visibility(
+            camera_count,
+            std::vector<char>(line_count, 0));
+        for (int camera_index = 0; camera_index < camera_count; ++camera_index) {
             const auto &input = cameras[camera_index];
+            if (input.pose_only != 0 && input.pose_only != 1) {
+                throw std::invalid_argument("Camera pose-only mode must be 0 or 1.");
+            }
+            if (camera_index < kBaseCameraCount && input.pose_only != 0) {
+                throw std::invalid_argument(
+                    "Cameras 0, 1, and 2 cannot use pose-only mode.");
+            }
             if (input.width <= 0 || input.height <= 0 ||
                 input.min_vertical_fov_degrees <= 1.0 ||
                 input.max_vertical_fov_degrees >= 179.0 ||
-                input.min_vertical_fov_degrees >= input.max_vertical_fov_degrees) {
-                throw std::invalid_argument("Camera dimensions or FOV bounds are invalid.");
+                input.min_vertical_fov_degrees >= input.max_vertical_fov_degrees ||
+                !std::isfinite(input.confidence) ||
+                input.confidence <= 0.0 ||
+                input.confidence > 1.0) {
+                throw std::invalid_argument("Camera dimensions, FOV bounds, or confidence are invalid.");
             }
 
             auto &camera = normalized_cameras[camera_index];
@@ -926,25 +2030,124 @@ std::int32_t RT_CALL RT_SolveThreeView(
             camera.principal = Vec2(camera.width * 0.5, camera.height * 0.5);
             camera.min_fov = input.min_vertical_fov_degrees;
             camera.max_fov = input.max_vertical_fov_degrees;
+            camera.confidence = input.confidence;
+            camera.pose_only = input.pose_only != 0;
             camera.min_focal = FocalFromVerticalFov(camera.height, camera.max_fov);
             camera.max_focal = FocalFromVerticalFov(camera.height, camera.min_fov);
 
-            auto &camera_observations = normalized_observations[camera_index];
-            camera_observations.reserve(point_count);
+            int visible_base_point_count = 0;
             for (int point_index = 0; point_index < point_count; ++point_index) {
-                const auto &point = observations[camera_index * point_count + point_index];
-                if (!std::isfinite(point.x) || !std::isfinite(point.y) ||
-                    point.x < 0.0 || point.x > input.width || point.y < 0.0 || point.y > input.height) {
-                    throw std::invalid_argument("An observation is non-finite or outside its image bounds.");
+                const int observation_index = camera_index * point_count + point_index;
+                if (observation_visibility[observation_index] == 0) {
+                    if (camera_index < kBaseCameraCount &&
+                        point_index < base_point_count) {
+                        throw std::invalid_argument(
+                            "Cameras 0, 1, and 2 must observe every base reference point.");
+                    }
+                    continue;
                 }
-                camera_observations.emplace_back(
-                    point.x * camera.pixel_scale, point.y * camera.pixel_scale);
+                if (camera_index < kBaseCameraCount &&
+                    point_index >= base_point_count) {
+                    throw std::invalid_argument(
+                        "Additional reference points must be absent from Cameras 0, 1, and 2.");
+                }
+                const auto &point = observations[camera_index * point_count + point_index];
+                const double point_confidence =
+                    observation_confidences[observation_index];
+                if (!std::isfinite(point.x) || !std::isfinite(point.y) ||
+                    point.x < 0.0 || point.x > input.width ||
+                    point.y < 0.0 || point.y > input.height ||
+                    !std::isfinite(point_confidence) ||
+                    point_confidence < 0.1 || point_confidence > 1.0) {
+                    throw std::invalid_argument(
+                        "A point observation, its bounds, or its confidence is invalid.");
+                }
+                normalized_observations[camera_index][point_index] =
+                    Vec2(point.x * camera.pixel_scale, point.y * camera.pixel_scale);
+                normalized_visibility[camera_index][point_index] = 1;
+                normalized_point_confidences[camera_index][point_index] =
+                    point_confidence;
+                visible_base_point_count += point_index < base_point_count ? 1 : 0;
             }
+            if (camera_index >= kBaseCameraCount && visible_base_point_count < 4) {
+                throw std::invalid_argument(
+                    "Each additional camera must observe at least 4 base reference points.");
+            }
+
+            for (int line_index = 0; line_index < line_count; ++line_index) {
+                const int observation_index = camera_index * line_count + line_index;
+                if (line_observation_visibility[observation_index] == 0) {
+                    if (camera_index < kBaseCameraCount) {
+                        throw std::invalid_argument(
+                            "Cameras 0, 1, and 2 must observe every base reference line.");
+                    }
+                    continue;
+                }
+                const auto &line =
+                    line_observations[observation_index];
+                if (!std::isfinite(line.start_x) || !std::isfinite(line.start_y) ||
+                    !std::isfinite(line.end_x) || !std::isfinite(line.end_y) ||
+                    !std::isfinite(line.confidence) ||
+                    line.confidence <= 0.0 || line.confidence > 1.0) {
+                    throw std::invalid_argument(
+                        "A line observation or its confidence is invalid.");
+                }
+
+                const double start_x = line.start_x * camera.pixel_scale;
+                const double start_y = line.start_y * camera.pixel_scale;
+                const double end_x = line.end_x * camera.pixel_scale;
+                const double end_y = line.end_y * camera.pixel_scale;
+                Vec3 equation(
+                    start_y - end_y,
+                    end_x - start_x,
+                    start_x * end_y - end_x * start_y);
+                const double normal_length = equation.head<2>().norm();
+                if (!std::isfinite(normal_length) || normal_length < 20.0) {
+                    throw std::invalid_argument(
+                        "A line handle is too short; make its RectTransform wider.");
+                }
+                equation /= normal_length;
+                normalized_line_observations[camera_index][line_index] = {
+                    equation,
+                    line.confidence};
+                normalized_line_visibility[camera_index][line_index] = 1;
+            }
+        }
+
+        for (int point_index = base_point_count; point_index < point_count; ++point_index) {
+            int visible_additional_cameras = 0;
+            for (int camera_index = kBaseCameraCount;
+                 camera_index < camera_count;
+                 ++camera_index) {
+                visible_additional_cameras +=
+                    !normalized_cameras[camera_index].pose_only &&
+                    normalized_visibility[camera_index][point_index]
+                        ? 1
+                        : 0;
+            }
+            if (visible_additional_cameras < 2) {
+                throw std::invalid_argument(
+                    "Each additional reference point must be observed by at least 2 non-pose-only additional cameras.");
+            }
+        }
+
+        PointObservationList base_observations(kBaseCameraCount);
+        PointConfidenceList base_point_confidences(kBaseCameraCount);
+        VisibilityList base_visibility(
+            kBaseCameraCount,
+            std::vector<char>(base_point_count, 1));
+        for (int camera_index = 0; camera_index < kBaseCameraCount; ++camera_index) {
+            base_observations[camera_index].assign(
+                normalized_observations[camera_index].begin(),
+                normalized_observations[camera_index].begin() + base_point_count);
+            base_point_confidences[camera_index].assign(
+                normalized_point_confidences[camera_index].begin(),
+                normalized_point_confidences[camera_index].begin() + base_point_count);
         }
 
         bool planar_degenerate = false;
         const auto pairs = EstimatePairGeometry(
-            normalized_observations, options->random_seed, &planar_degenerate);
+            base_observations, options->random_seed, &planar_degenerate);
         if (pairs.size() < 2) {
             report->status = RT_DEGENERATE_GEOMETRY;
             WriteError(error_buffer, error_buffer_capacity, "Unable to estimate enough pairwise geometry.");
@@ -960,7 +2163,12 @@ std::int32_t RT_CALL RT_SolveThreeView(
         }
 
         auto candidates = CreateInitialCandidates(
-            pairs, normalized_cameras, normalized_observations, options->random_seed);
+            pairs,
+            normalized_cameras,
+            base_observations,
+            base_visibility,
+            base_point_confidences,
+            options->random_seed);
         if (candidates.empty()) {
             report->status = RT_INITIALIZATION_FAILED;
             WriteError(
@@ -975,22 +2183,161 @@ std::int32_t RT_CALL RT_SolveThreeView(
             candidates.resize(static_cast<std::size_t>(requested_candidates));
         }
         std::vector<Candidate> optimized;
+        bool initialized_all_cameras = camera_count == kBaseCameraCount;
+        int failed_additional_camera = -1;
+        bool initialized_all_points = point_count == base_point_count;
+        int failed_additional_point = -1;
+        bool initialized_any_lines = line_count == 0;
+        bool localized_all_pose_only_cameras = true;
+        int failed_pose_only_camera = -1;
         for (Candidate &candidate : candidates) {
+            // 先用基础三视图生成三维线，供附加相机初始化时参考。
+            if (!InitializeCandidateLines(
+                    &candidate,
+                    normalized_cameras,
+                    normalized_line_observations,
+                    normalized_line_visibility)) {
+                continue;
+            }
+            initialized_any_lines = true;
+
+            int failed_camera_index = -1;
+            if (!InitializeAdditionalCameras(
+                    &candidate,
+                    normalized_cameras,
+                    normalized_observations,
+                    normalized_visibility,
+                    normalized_point_confidences,
+                    normalized_line_observations,
+                    normalized_line_visibility,
+                    options->random_seed,
+                    &failed_camera_index)) {
+                failed_additional_camera = failed_camera_index;
+                continue;
+            }
+            initialized_all_cameras = true;
+            int failed_point_index = -1;
+            if (!InitializeAdditionalPoints(
+                    &candidate,
+                    normalized_cameras,
+                    normalized_observations,
+                    normalized_visibility,
+                    base_point_count,
+                    &failed_point_index)) {
+                failed_additional_point = failed_point_index;
+                continue;
+            }
+            initialized_all_points = true;
+            if (!InitializeCandidateLines(
+                    &candidate,
+                    normalized_cameras,
+                    normalized_line_observations,
+                    normalized_line_visibility)) {
+                continue;
+            }
+            initialized_any_lines = true;
             if (OptimizeCandidate(
-                    &candidate, normalized_cameras, normalized_observations)) {
+                    &candidate,
+                    normalized_cameras,
+                    normalized_observations,
+                    normalized_visibility,
+                    normalized_point_confidences,
+                    normalized_line_observations,
+                    normalized_line_visibility)) {
+                int failed_pose_camera_index = -1;
+                if (!OptimizePoseOnlyCameras(
+                        &candidate,
+                        normalized_cameras,
+                        normalized_observations,
+                        normalized_visibility,
+                        normalized_point_confidences,
+                        normalized_line_observations,
+                        normalized_line_visibility,
+                        &failed_pose_camera_index)) {
+                    localized_all_pose_only_cameras = false;
+                    failed_pose_only_camera = failed_pose_camera_index;
+                    continue;
+                }
                 optimized.push_back(std::move(candidate));
             }
         }
         if (optimized.empty()) {
             report->status = RT_OPTIMIZATION_FAILED;
-            WriteError(error_buffer, error_buffer_capacity, "Bundle adjustment did not produce a usable solution.");
+            std::string optimization_error;
+            if (!initialized_all_cameras && failed_additional_camera >= 0) {
+                int visible_base_points = 0;
+                for (int point_index = 0;
+                     point_index < base_point_count;
+                     ++point_index) {
+                    visible_base_points +=
+                        normalized_visibility[failed_additional_camera][point_index]
+                            ? 1
+                            : 0;
+                }
+                int visible_lines = 0;
+                for (int line_index = 0;
+                     line_index < line_count;
+                     ++line_index) {
+                    visible_lines +=
+                        normalized_line_visibility[failed_additional_camera][line_index]
+                            ? 1
+                            : 0;
+                }
+                optimization_error =
+                    "Additional Camera " + std::to_string(failed_additional_camera) +
+                    " could not be initialized or refined from " +
+                    std::to_string(visible_base_points) +
+                    " visible base points and " +
+                    std::to_string(visible_lines) +
+                    " reference lines. "
+                    "Lines refine the point-based P4Pf initialization but cannot replace its "
+                    "minimum 4 base points. Check point and line IDs, image coordinates, "
+                    "point spread, and FOV bounds.";
+            } else if (!initialized_all_points) {
+                optimization_error =
+                    "Additional point ID " +
+                    std::to_string(point_ids[failed_additional_point]) +
+                    " could not be triangulated. "
+                    "Mark it in at least 2 non-pose-only additional cameras with enough parallax.";
+            } else if (!localized_all_pose_only_cameras) {
+                optimization_error =
+                    "Pose-only Camera " +
+                    std::to_string(failed_pose_only_camera) +
+                    " could not be localized against the fixed 3D structure. "
+                    "Check its point and line IDs, FOV bounds, and point spread.";
+            } else if (initialized_any_lines) {
+                optimization_error = "Bundle adjustment did not produce a usable solution.";
+            } else {
+                optimization_error =
+                    "The reference lines cannot form stable 3D lines. "
+                    "Check their IDs and viewing angles.";
+            }
+            WriteError(
+                error_buffer,
+                error_buffer_capacity,
+                optimization_error);
             return report->status;
         }
 
         std::sort(optimized.begin(), optimized.end(), [](const Candidate &left, const Candidate &right) {
-            return left.rms < right.rms;
+            return left.score < right.score;
         });
         Candidate best = std::move(optimized.front());
+
+        // Preserve the best candidate so the editor can diagnose failed solves per image.
+        FillOutputs(
+            best,
+            normalized_cameras,
+            normalized_observations,
+            normalized_visibility,
+            normalized_point_confidences,
+            normalized_line_observations,
+            normalized_line_visibility,
+            point_ids,
+            line_ids,
+            camera_outputs,
+            point_outputs,
+            line_outputs);
 
         if (best.median_angle < 1.0) {
             report->status = RT_DEGENERATE_GEOMETRY;
@@ -1009,18 +2356,53 @@ std::int32_t RT_CALL RT_SolveThreeView(
             best,
             normalized_cameras,
             normalized_observations,
+            normalized_visibility,
+            normalized_point_confidences,
             point_ids,
             allowed_error);
-        if (!point_error.empty() || best.rms > allowed_error) {
+        const std::string line_error = HighErrorLineMessage(
+            best,
+            normalized_cameras,
+            normalized_line_observations,
+            normalized_line_visibility,
+            line_ids,
+            allowed_error);
+        const std::string pose_only_error = HighErrorPoseOnlyCameraMessage(
+            best,
+            normalized_cameras,
+            normalized_observations,
+            normalized_visibility,
+            normalized_point_confidences,
+            normalized_line_observations,
+            normalized_line_visibility,
+            point_ids,
+            line_ids,
+            allowed_error);
+        if (!point_error.empty() || !line_error.empty() ||
+            !pose_only_error.empty() ||
+            best.rms > allowed_error || best.line_rms > allowed_error) {
             report->status = RT_HIGH_REPROJECTION_ERROR;
+            std::string error = point_error;
+            if (!line_error.empty()) {
+                if (!error.empty()) {
+                    error += "\n";
+                }
+                error += line_error;
+            }
+            if (!pose_only_error.empty()) {
+                if (!error.empty()) {
+                    error += "\n";
+                }
+                error += pose_only_error;
+            }
             WriteError(
                 error_buffer,
                 error_buffer_capacity,
-                point_error.empty() ? "The final reprojection error is too high." : point_error);
+                error.empty() ? "The final reprojection error is too high." : error);
             return report->status;
         }
 
-        for (int camera_index = 0; camera_index < kCameraCount; ++camera_index) {
+        for (int camera_index = 0; camera_index < camera_count; ++camera_index) {
             const double vertical_fov =
                 FovFromFocal(normalized_cameras[camera_index].height, best.focals[camera_index]);
             if (vertical_fov <= normalized_cameras[camera_index].min_fov + 0.2 ||
@@ -1036,9 +2418,9 @@ std::int32_t RT_CALL RT_SolveThreeView(
 
         if (optimized.size() > 1) {
             const Candidate &second = optimized[1];
-            if (second.rms <= best.rms * 1.01 + 1e-6) {
+            if (second.score <= best.score * 1.01 + 1e-6) {
                 double maximum_fov_difference = 0.0;
-                for (int camera_index = 0; camera_index < kCameraCount; ++camera_index) {
+                for (int camera_index = 0; camera_index < camera_count; ++camera_index) {
                     const double first_fov =
                         FovFromFocal(normalized_cameras[camera_index].height, best.focals[camera_index]);
                     const double second_fov =
@@ -1062,14 +2444,22 @@ std::int32_t RT_CALL RT_SolveThreeView(
             best,
             normalized_cameras,
             normalized_observations,
+            normalized_visibility,
+            normalized_point_confidences,
+            normalized_line_observations,
+            normalized_line_visibility,
             point_ids,
+            line_ids,
             camera_outputs,
-            point_outputs);
+            point_outputs,
+            line_outputs);
 
         report->status = RT_SUCCESS;
         report->point_count = point_count;
         report->inlier_count = point_count;
+        report->line_count = line_count;
         report->normalized_reprojection_rms = best.rms;
+        report->normalized_line_rms = best.line_rms;
         report->median_triangulation_angle_degrees = best.median_angle;
         report->applied_scale = applied_scale;
         return RT_SUCCESS;

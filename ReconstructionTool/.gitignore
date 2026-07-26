@@ -13,3 +13,7 @@
 .vs/
 .vscode/
 .idea/
+
+# Native dependency and build caches
+Native/ReconstructionNative/.native-build/
+Native/ReconstructionNative/.native-deps/
