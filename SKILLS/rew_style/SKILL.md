@@ -1,6 +1,6 @@
 ---
 name: rew_style
-description: "Use when the user wants code generation to follow a strict house style: add brief Chinese XML doc comments to newly added functions, avoid extracting one-off short functions, keep logic simple and concise, and split larger blocks with single-line comments."
+description: "Use when the user wants code generation to follow a strict house style: use precise action-based identifier names, add brief Chinese XML doc comments to newly added functions, avoid extracting one-off short functions, keep logic simple and concise, and split larger blocks with single-line comments."
 user_invocable: true
 version: 0.1
 ---
@@ -27,7 +27,9 @@ version: 0.1
 
 ## 标识符命名
 
-- 命名时尽量少用 `Ensure`、`Normalize`、`Resolve` 这三个泛词：`Ensure` 优先改成 `Check`、`Validate` 或更具体动作；`Normalize` 仅用于几何/图形学含义的归一化，其他路径、文本、资源场景用更具体的命名；`Resolve` 任何情况下都尽量少用，优先改成能表达真实动作的词。
+- 命名时尽量少用 `Ensure`、`Normalize` 这类泛词：`Ensure` 优先改成 `Check`、`Validate` 或更具体动作；`Normalize` 仅用于几何/图形学含义的归一化，其他路径、文本、资源场景用更具体的命名。
+- 项目自定义标识符禁止使用宽泛的 `Resolve` 作为兜底动词。命名前必须确认真实动作：加载资源使用 `Load`，获取已有对象使用 `Get`，解析文本或序列化数据使用 `Parse`，读取外部数据使用 `Read`，类型或表示转换使用 `Convert` 或 `To`，查找目标使用 `Find`；同时包含获取和加载时使用 `GetOrLoad` 等能完整表达行为的组合名称。
+- 函数包含多步操作时，名称必须体现主要结果或可观察副作用，不能用 `Resolve` 隐藏其实际行为。例如使用 `LoadBuiltinShaders`，不要使用 `ResolveBuiltinResources`。
 - 不要把 `Make` 当默认兜底动词；除非确实是在构造新值，否则优先用 `Get`、`To`、`Build`、`Create`、`Write`、`Find`、`Check`、`Validate` 等更具体动作。  
 
 
