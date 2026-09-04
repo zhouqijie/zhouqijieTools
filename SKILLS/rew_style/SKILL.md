@@ -1,6 +1,6 @@
 ---
 name: rew_style
-description: "Use when the user wants code generation to follow a strict house style: use precise action-based identifier names, add brief Chinese XML doc comments to newly added functions, avoid extracting one-off short functions, keep logic simple and concise, and split larger blocks with single-line comments."
+description: "Use when the user wants code generation to follow a strict house style: use precise action-based identifier names, add brief Chinese XML doc comments to newly added functions, avoid extracting one-off short functions, keep logic simple and concise, and split larger blocks with concise single-line action-summary comments."
 user_invocable: true
 version: 0.1
 ---
@@ -33,25 +33,31 @@ version: 0.1
 - 不要把 `Make` 当默认兜底动词；除非确实是在构造新值，否则优先用 `Get`、`To`、`Build`、`Create`、`Write`、`Find`、`Check`、`Validate` 等更具体动作。  
 
 
-## 注释  
+## 注释
 
-- 新增函数应附带对应注释，长逻辑段应做分块注释。
-- 避免出现大段没有注释分隔的代码块。  
+- 新增函数应添加简短的中文职责注释；C# public 函数使用单行 XML `summary` 注释。
+- 长逻辑应使用**阶段代码块注释**划分语义阶段，避免出现大段没有注释分隔的代码。
+- 阶段代码块注释是紧邻逻辑块开头的单行 `//` 注释，用动作明确的短语概述紧随其后的代码“做了什么”。
+- 阶段代码块注释使用 `//动作 + 对象` 格式，不加句号，不使用编号；例如 `//加载 hostfxr 动态库`、`//获取程序集加载委托`、`//检查函数绑定结果`。
+- 代码块注释不要写实现原因、注意事项、失败后果或流程解释，避免使用“为了”“避免”“确保”“否则”“以便”“防止”等说明性表达。
+- 只给有独立语义的代码块添加注释，不逐行复述代码。
 
 代码注释示例：
 ```
-//public 函数使用单行注释  
-public void Foo(){}
-//private 函数也使用单行注释  
-private void Bar(){}
-```  
+//读取资源配置
+private void ReadResourceConfig() {}
 
-```csharp
-/// <summary> C# public 函数使用单行 summary 注释 </summary>
-public void Foo(){}
+//绘制天空盒
+if (camera.clearMode == ClearMode::SolidColor)
+{
+    RenderSkybox(scene, camera, gpuResourceManager);
+}
 ```
 
-
+```csharp
+/// <summary>读取资源配置。</summary>
+public void ReadResourceConfig() {}
+`$([Environment]::NewLine)
 ## 计划模式补充规则
 
 - 在计划模式下，不要急于开始实现；优先通过提问把需求和技术方案讨论清楚。
@@ -68,3 +74,6 @@ public void Foo(){}
 ## 适用范围
 
 所有 agent 编码任务中，只要用户希望生成结果遵守该编码风格，就应优先采用本 skill 的规则。
+
+
+
